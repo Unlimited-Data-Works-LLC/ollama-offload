@@ -191,6 +191,32 @@ class TestWireBody(OllamaOffloadTestCase):
         self.assertEqual(result["_meta"]["prompt_tokens"], 22)
 
 
+class TestConfigRelocation(OllamaOffloadTestCase):
+    def test_config_path_follows_the_env_var(self):
+        """Vendoring this module read-only requires the config to live elsewhere.
+
+        Without the override the config must sit inside the vendored copy, so
+        every update overwrites local settings and a caller's real hosts cannot
+        be kept outside the dependency.
+        """
+        elsewhere = os.path.join(self._tmp.name, "my_hosts.json")
+        with open(elsewhere, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://elsewhere.invalid:11434/api/chat",
+                       "model": "some-model",
+                       "reviewer": {"context_usage_ratio": 0.25}}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = elsewhere
+        os.environ.pop("OLLAMA_OFFLOAD_URL", None)
+        import ollama_offload
+
+        mod = importlib.reload(ollama_offload)
+        self.assertEqual(str(mod._CONFIG_PATH), elsewhere)
+        self.assertEqual(mod._CFG.get("model"), "some-model")
+        # A consumer section from the relocated file must resolve, not fall
+        # back to {} and silently take default ratios.
+        self.assertEqual(mod.get_consumer_config("reviewer"),
+                         {"context_usage_ratio": 0.25})
+
+
 class TestEnvironmentNamespace(unittest.TestCase):
     def test_ollama_host_is_not_read(self):
         """OLLAMA_HOST belongs to Ollama itself; reading it would hijack the user's setting."""

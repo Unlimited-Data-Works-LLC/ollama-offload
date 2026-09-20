@@ -71,6 +71,13 @@ git clone https://github.com/Unlimited-Data-Works-LLC/ollama-offload
 cp -r ollama-offload/src /path/to/your/project/vendor/ollama-offload
 ```
 
+Vendoring it read-only? Keep your config outside the dependency and point at it, so an
+update never overwrites your hosts:
+
+```bash
+export OLLAMA_OFFLOAD_CONFIG=/etc/myapp/ollama-offload.json
+```
+
 Python 3.10+ (`jsonschema` optional, for config validation). PowerShell 7+ for the `.psm1`.
 
 ## Configuring
@@ -123,6 +130,7 @@ a test asserting this library never reads them.
 
 | Variable | Effect |
 |---|---|
+| `OLLAMA_OFFLOAD_CONFIG` | read the config from this path instead of next to the module |
 | `OLLAMA_OFFLOAD_HOST` | pick a `hosts.<name>` entry |
 | `OLLAMA_OFFLOAD_URL` | raw `/api/chat` URL, bypassing the map |
 | `OLLAMA_OFFLOAD_MODEL` | override the discovered model |

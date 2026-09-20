@@ -41,7 +41,15 @@ except Exception:
 
 # Config: a JSON file next to this module, with environment overrides taking precedence.
 # Models, URLs and thresholds all move over time, so nothing here is compiled in.
-_CONFIG_PATH = Path(__file__).parent / "ollama_offload_config.json"
+#
+# OLLAMA_OFFLOAD_CONFIG relocates the file. That matters when this module is vendored
+# into another tree read-only: without it the config must live inside the vendored copy,
+# so every update overwrites local settings and a caller's real hosts cannot be kept
+# outside the dependency.
+_CONFIG_PATH = Path(
+    os.environ.get("OLLAMA_OFFLOAD_CONFIG")
+    or (Path(__file__).parent / "ollama_offload_config.json")
+)
 _CONFIG_SCHEMA_PATH = Path(__file__).parent / "ollama_offload_config.schema.json"
 
 # Used only when neither the resolved host entry nor the config's top-level

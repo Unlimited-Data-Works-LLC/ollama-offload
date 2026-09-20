@@ -75,7 +75,11 @@ class OllamaConfigError : System.Exception {
 # Used only when neither the resolved host entry nor the config names a model, and
 # runtime discovery has not run. Discovery from /api/ps and /api/tags supersedes it.
 $Script:DefaultModelHint = 'qwen3:8b'
-$Script:ConfigPath   = Join-Path $PSScriptRoot 'ollama_offload_config.json'
+# OLLAMA_OFFLOAD_CONFIG relocates the config file, for the case where this module is
+# vendored into another tree read-only and the caller's real hosts must live outside
+# the dependency. Python parity: _CONFIG_PATH reads the same variable.
+$Script:ConfigPath   = if ($env:OLLAMA_OFFLOAD_CONFIG) { $env:OLLAMA_OFFLOAD_CONFIG }
+                       else { Join-Path $PSScriptRoot 'ollama_offload_config.json' }
 $Script:CooldownPath = Join-Path $env:TEMP 'ollama_offload_cooldown.until'   # SHARED with Python
 $Script:Discovered   = $null     # cached { Model, ContextTokens, KeepAlive, BaseUrl }
 $Script:CachedConfig = $null
