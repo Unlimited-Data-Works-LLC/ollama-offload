@@ -1,0 +1,48 @@
+{
+  "_doc": "Configuration for ollama-offload. `hosts.<name>` maps a logical name to an inference endpoint; `default_host` picks the active one. Environment overrides win over this file: OLLAMA_OFFLOAD_HOST selects which host entry to use, and OLLAMA_OFFLOAD_URL / _MODEL / _TIMEOUT_S / _TEMPERATURE / _CONTEXT_TOKENS / _THINK / _KEEP_ALIVE override individual fields. The OLLAMA_OFFLOAD_ prefix is deliberate: Ollama's own OLLAMA_HOST, OLLAMA_MODELS and OLLAMA_KEEP_ALIVE variables configure the Ollama server and CLI, and a library that read those would change behaviour for anyone who has them set for a different purpose. Input-size caps are DERIVED at runtime from the model's real context window, learned via /api/show, never hardcoded here -- per-consumer values below are RATIOS of that discovered window. Override a consumer with an absolute byte cap using its `max_input_bytes_override` key.",
+
+  "default_host": "primary",
+  "hosts": {
+    "primary": {
+      "url": "http://localhost:11434/api/chat",
+      "model": "qwen3:8b",
+      "context_tokens_fallback": 8192,
+      "notes": "Fallback context is used only when /api/show does not report a window for the model."
+    },
+    "secondary": {
+      "url": "http://ollama-2.example.internal:11434/api/chat",
+      "model": "qwen3:8b",
+      "context_tokens_fallback": 8192,
+      "notes": "Example of a second host. Add it to failover_hosts, or set strategy to round-robin, to put it in the rotation."
+    }
+  },
+
+  "url": "http://localhost:11434/api/chat",
+  "model": "qwen3:8b",
+  "context_tokens_fallback": 8192,
+
+  "timeout_s": 300,
+  "temperature": 0.1,
+  "max_retries": 3,
+  "base_backoff_s": 1.0,
+  "cooldown_on_fail_s": 300,
+
+  "failover_hosts": [],
+  "strategy": "primary",
+
+  "_doc_think": "Ollama's top-level /api/chat `think` field. Reasoning models default to thinking ON, which for a structured-JSON extraction contract adds latency without improving the result and can stall a call for the full timeout. Measured against a reasoning model: think=false returned in 1.5s where omitting the field hung past 180s. Per-call `think=` overrides this; so does OLLAMA_OFFLOAD_THINK.",
+  "think": false,
+
+  "_doc_keep_alive": "Seconds to keep the model resident, or -1 to pin it indefinitely. Set explicitly rather than left to the server default, so a cold reload never lands in the middle of a batch.",
+  "keep_alive": -1,
+
+  "_doc_consumers": "Each key below is a CONSUMER: a named caller with its own share of the context window. Pass its name as consumer= / -Consumer and the client sizes input against that ratio. Splitting callers this way keeps a chatty consumer from crowding out a careful one, and makes the per-caller budget reviewable in one file. Add your own; these two are examples.",
+
+  "summarizer": {
+    "context_usage_ratio": 0.30
+  },
+  "classifier": {
+    "context_usage_ratio": 0.40,
+    "batch_size": 25
+  }
+}

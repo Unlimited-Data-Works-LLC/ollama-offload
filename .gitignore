@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Local overrides: real hostnames, key paths, timeouts.
+.env
+
+# Cooldown and rotation sidecars, if TEMP is ever redirected into the tree.
+*.until
+*.next
