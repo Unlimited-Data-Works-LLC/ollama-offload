@@ -312,6 +312,43 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
                          "value on the wire")
         self.assertEqual(result["_meta"]["model"], "explicit-pin")
 
+    def test_hint_never_reaches_wire_when_discovery_fails_at_import(self):
+        """F5: primary DOWN at import → hint fired → call_ollama must NOT
+        ship the hint on the wire; a fresh discovery is attempted, and if
+        that also fails, OllamaCallError is raised. The library's central
+        fault-separation claim depends on this — benching a healthy host on
+        a wrong-model 4xx would invert it (see :493-499).
+        """
+        # Set up: urlopen that fails BOTH /api/ps and /api/tags — the two
+        # sources _discover_model consults. /api/version + /api/chat still
+        # answer so the reachability pre-flight + the actual call succeed
+        # up to the resolution site.
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down"),
+            "/api/tags": urllib.error.URLError("primary down"),
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        # Confirm the hint fired at import.
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "hint")
+        # Now attempt a call; the guard must intercept before shipping the
+        # hint to any host.
+        with self.assertRaises(mod.OllamaCallError) as ctx:
+            mod.call_ollama("go", schema=SCHEMA)
+        self.assertIn("_DEFAULT_MODEL_HINT", str(ctx.exception),
+                      "the error must name the discovery-fallback so an "
+                      "operator can act on it, not surface as a generic call "
+                      "failure")
+
     def test_env_override_wins_over_config_pin(self):
         """``OLLAMA_OFFLOAD_MODEL`` per README:136 must override the pin.
 

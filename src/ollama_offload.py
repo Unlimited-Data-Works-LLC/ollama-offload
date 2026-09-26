@@ -374,8 +374,10 @@ def _discover_model(*, base_url: str | None = None) -> str:
     or a failover). Precedent: :641 ``ollama_alive(base_url=)``. Default of ``None``
     preserves import-time behaviour of probing the module-active host.
     """
+    global _DEFAULT_MODEL_SOURCE
     override = os.environ.get("OLLAMA_OFFLOAD_MODEL")
     if override:
+        _DEFAULT_MODEL_SOURCE = "env"
         return override
 
     def _pick_best(models: list[dict]) -> str | None:
@@ -399,11 +401,32 @@ def _discover_model(*, base_url: str | None = None) -> str:
         models = payload.get("models") or []
         picked = _pick_best(models)
         if picked:
+            _DEFAULT_MODEL_SOURCE = "ps" if endpoint == "/api/ps" else "tags"
             return picked
 
     # Everything failed — return a config-file value or a last-resort literal so the actual
     # call still has a name to send. It'll error explicitly if that name isn't installed.
-    return _CFG.get("model") or _DEFAULT_MODEL_HINT
+    # Also mark the module-level source flag: consumers can force a rediscovery at first call
+    # instead of shipping a stale hint to a REACHABLE per-call host that was never asked
+    # (F5 in the 2026-09-26 DA-Fable review of 3987814).
+    cfg_pin = _CFG.get("model")
+    if cfg_pin:
+        _DEFAULT_MODEL_SOURCE = "cfg"
+        return cfg_pin
+    _DEFAULT_MODEL_SOURCE = "hint"
+    return _DEFAULT_MODEL_HINT
+
+
+# Source of DEFAULT_MODEL, set by _discover_model. Values:
+#   "env" — OLLAMA_OFFLOAD_MODEL was set at import
+#   "ps"  — /api/ps returned a model on the module-active host
+#   "tags"— /api/tags returned a model
+#   "cfg" — top-level `_CFG["model"]` was set and discovery failed
+#   "hint"— everything failed; the hardcoded _DEFAULT_MODEL_HINT was used
+# The wire-body resolution below forces a fresh discovery against the per-call
+# host whenever this is "hint", so a REACHABLE failover/override host does not
+# receive the import-time hint's homelab-specific name.
+_DEFAULT_MODEL_SOURCE: str = "unknown"
 
 
 DEFAULT_MODEL = _discover_model()
@@ -734,6 +757,24 @@ def _call_ollama_once(
         # would send the ACTIVE host's discovered model to the secondary,
         # exactly the failure the 3987814 follow-up (3) named.
         _effective_model = _discover_model(base_url=_call_base)
+    elif _DEFAULT_MODEL_SOURCE == "hint":
+        # F5: import-time discovery fell back to the hardcoded hint (primary
+        # host was DOWN at import). Do NOT ship that hint to a REACHABLE host
+        # that was never asked — a homelab-specific model name (`qwen3.6:35b`)
+        # sent to a host that doesn't serve it becomes a 4xx, three retries,
+        # and a cooldown that BENCHES A HEALTHY HOST on a model fault —
+        # inverting the library's central fault-separation claim (:493-499).
+        # Retry discovery against the per-call base first; if that ALSO
+        # returns the hint, raise a clear config error rather than send a
+        # probably-wrong name.
+        _effective_model = _discover_model(base_url=_call_base)
+        if _DEFAULT_MODEL_SOURCE == "hint":
+            raise OllamaCallError(
+                f"model discovery fell back to _DEFAULT_MODEL_HINT for host="
+                f"{_call_host['name']} at {_call_base}. Set OLLAMA_OFFLOAD_MODEL, "
+                f"add `model` to the host entry, or ensure /api/ps + /api/tags "
+                f"answer with an installed model before calling."
+            )
     else:
         _effective_model = DEFAULT_MODEL
     # Parity: this twin never sent num_ctx; the psm1 twin always did. Resolved
