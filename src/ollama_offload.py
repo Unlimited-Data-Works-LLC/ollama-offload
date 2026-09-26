@@ -360,7 +360,7 @@ def active_host_name() -> str:
     return _ACTIVE_HOST["name"]
 
 
-def _discover_model() -> str:
+def _discover_model(*, base_url: str | None = None) -> str:
     """Learn the primary chat model DYNAMICALLY from the host at runtime.
 
     Strategy: /api/ps first (models currently loaded in RAM — the authoritative "what's
@@ -368,6 +368,11 @@ def _discover_model() -> str:
     embedding models; prefer the largest by parameter count / size. OLLAMA_OFFLOAD_MODEL env
     override wins if set (for ops override or CI pinning). Fail-open to the last-known
     default if the API is unreachable — the actual call will error clearly later.
+
+    ``base_url`` overrides the probe target — pass the resolved per-call base
+    when a runtime caller has selected a non-active host (via ``call_ollama(host=…)``
+    or a failover). Precedent: :641 ``ollama_alive(base_url=)``. Default of ``None``
+    preserves import-time behaviour of probing the module-active host.
     """
     override = os.environ.get("OLLAMA_OFFLOAD_MODEL")
     if override:
@@ -384,7 +389,7 @@ def _discover_model() -> str:
             return max(chat_with_size, key=lambda m: m["size"])["name"]
         return sorted(m["name"] for m in chat)[-1]  # lexicographic — later versions sort higher
 
-    base = _api_base()
+    base = base_url if base_url is not None else _api_base()
     for endpoint in ("/api/ps", "/api/tags"):
         try:
             with urllib.request.urlopen(urllib.request.Request(base + endpoint), timeout=5) as resp:
@@ -404,7 +409,7 @@ def _discover_model() -> str:
 DEFAULT_MODEL = _discover_model()
 
 
-def _discover_context_tokens(model: str) -> int:
+def _discover_context_tokens(model: str, *, base_url: str | None = None) -> int:
     """Learn the model's LOADED context window DYNAMICALLY (the runtime num_ctx that
     Ollama is actually serving), not the architectural maximum.
 
@@ -419,6 +424,11 @@ def _discover_context_tokens(model: str) -> int:
     We MUST use the runtime value or we will over-fill prompts. Probe pattern:
     a mismatch between architectural max and runtime is normal (operator chooses),
     but the RUNTIME value is what serves the request.
+
+    ``base_url`` overrides the probe target for the per-call host — see
+    :func:`_discover_model` for the same pattern. Without it a runtime probe
+    for a failed-over or ``host=<name>``-overridden call would hit the
+    module-active host, sending the wrong host's context to the right host.
     """
     override = os.environ.get("OLLAMA_OFFLOAD_CONTEXT_TOKENS")
     if override:
@@ -427,9 +437,11 @@ def _discover_context_tokens(model: str) -> int:
         except ValueError:
             pass
 
+    base = base_url if base_url is not None else _api_base()
+
     # PRIMARY: /api/ps (the LOADED runtime context — what actually gets served).
     try:
-        with urllib.request.urlopen(urllib.request.Request(_api_base() + "/api/ps"), timeout=5) as resp:
+        with urllib.request.urlopen(urllib.request.Request(base + "/api/ps"), timeout=5) as resp:
             ps = json.loads(resp.read().decode("utf-8"))
         for m in ps.get("models") or []:
             if m.get("name") == model or m.get("model") == model:
@@ -443,7 +455,7 @@ def _discover_context_tokens(model: str) -> int:
     # FALLBACK: /api/show -> num_ctx from parameters (Modelfile-declared runtime context).
     try:
         req = urllib.request.Request(
-            _api_base() + "/api/show",
+            base + "/api/show",
             data=json.dumps({"model": model}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -704,7 +716,7 @@ def _call_ollama_once(
     # path costs nothing; only a genuine model override pays for a discovery probe.
     _effective_context_tokens = (
         DEFAULT_CONTEXT_TOKENS if _effective_model == DEFAULT_MODEL
-        else _discover_context_tokens(_effective_model)
+        else _discover_context_tokens(_effective_model, base_url=_call_base)
     )
 
     # persistent per-host cooldown check. Reads the
