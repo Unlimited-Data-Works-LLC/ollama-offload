@@ -217,6 +217,72 @@ class TestConfigRelocation(OllamaOffloadTestCase):
                          {"context_usage_ratio": 0.25})
 
 
+class TestNonCoincidentModelDiscovery(unittest.TestCase):
+    """The stock fixture pins config model == /api/ps == qwen3:8b, so a bug that
+    resolves the wrong side of the two would look identical to the fix. These
+    cases pull the two names apart so only ONE order can pass each assertion."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._env = dict(os.environ)
+        os.environ["TEMP"] = self._tmp.name
+        os.environ["TMP"] = self._tmp.name
+        os.environ.pop("OLLAMA_OFFLOAD_URL", None)
+        for noisy in ("OLLAMA_OFFLOAD_HOST", "OLLAMA_OFFLOAD_MODEL"):
+            os.environ.pop(noisy, None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._tmp.cleanup()
+
+    def _reload_with_config(self, cfg):
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import ollama_offload
+        return importlib.reload(ollama_offload)
+
+    def _canned(self, ps_model):
+        return {
+            "/api/version": VERSION,
+            "/api/ps": {"models": [{"name": ps_model, "context_length": 8192}]},
+            "/api/tags": {"models": [{"name": ps_model}]},
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+
+    def test_discovered_reaches_wire_when_config_omits_model(self):
+        """No config pin: /api/ps says qwen3.6:35b; body must send qwen3.6:35b."""
+        mod = self._reload_with_config({"url": "http://test.invalid:11434/api/chat"})
+        sent = []
+        mod.urllib.request.urlopen = _routed_urlopen(self._canned("qwen3.6:35b"),
+                                                    record=sent)
+        result = mod.call_ollama("go", schema=SCHEMA)
+        chat_bodies = [b for b in sent if "messages" in b]
+        self.assertEqual(chat_bodies[-1]["model"], "qwen3.6:35b",
+                         "with no config pin, the wire body must carry the "
+                         "value discovered from /api/ps")
+        self.assertEqual(result["_meta"]["model"], "qwen3.6:35b")
+
+    def test_config_pin_wins_over_discovered(self):
+        """Config pin set to 'explicit-pin'; /api/ps disagrees. Pin must win."""
+        mod = self._reload_with_config({
+            "url": "http://test.invalid:11434/api/chat",
+            "model": "explicit-pin",
+        })
+        sent = []
+        mod.urllib.request.urlopen = _routed_urlopen(self._canned("qwen3.6:35b"),
+                                                    record=sent)
+        result = mod.call_ollama("go", schema=SCHEMA)
+        chat_bodies = [b for b in sent if "messages" in b]
+        self.assertEqual(chat_bodies[-1]["model"], "explicit-pin",
+                         "a configured model pin must override any discovered "
+                         "value on the wire")
+        self.assertEqual(result["_meta"]["model"], "explicit-pin")
+
+
 class TestEnvironmentNamespace(unittest.TestCase):
     def test_ollama_host_is_not_read(self):
         """OLLAMA_HOST belongs to Ollama itself; reading it would hijack the user's setting."""
