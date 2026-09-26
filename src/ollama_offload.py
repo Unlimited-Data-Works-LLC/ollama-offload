@@ -708,14 +708,46 @@ def _call_ollama_once(
         _call_host = _ACTIVE_HOST
     _call_url = _call_host["url"]
     _call_base = _call_url.rsplit("/api/", 1)[0]
-    _effective_model = model if model is not None else (_call_host.get("model") or DEFAULT_MODEL)
+    # Precedence (highest first, per README:136 + docstring at :55-60):
+    #   1. explicit ``model=`` per-call arg — caller's explicit intent
+    #   2. OLLAMA_OFFLOAD_MODEL env — ops override / CI pin
+    #   3. per-host config pin `hosts.<name>.model`
+    #   4. runtime discovery on the resolved per-call host (only when the
+    #      override host has no pin AND is not the module-active host — the
+    #      active host's model was already discovered into DEFAULT_MODEL at
+    #      import). Passes ``base_url=_call_base`` so the probe hits the
+    #      RIGHT host, not the module-active one.
+    #   5. DEFAULT_MODEL — the import-time snapshot of the active host.
+    # Pre-3987814 this collapsed to a single truthy check on the pin, which
+    # made env-override dead whenever config pinned a model — the exact
+    # violation of README:136 the fix commit claimed to close.
+    _env_model_override = os.environ.get("OLLAMA_OFFLOAD_MODEL")
+    if model is not None:
+        _effective_model = model
+    elif _env_model_override:
+        _effective_model = _env_model_override
+    elif _call_host.get("model"):
+        _effective_model = _call_host["model"]
+    elif _call_host is not _ACTIVE_HOST:
+        # Per-call host override with no pin — probe THIS host, not the
+        # module-active one. Without this, a `call_ollama(host="secondary")`
+        # would send the ACTIVE host's discovered model to the secondary,
+        # exactly the failure the 3987814 follow-up (3) named.
+        _effective_model = _discover_model(base_url=_call_base)
+    else:
+        _effective_model = DEFAULT_MODEL
     # Parity: this twin never sent num_ctx; the psm1 twin always did. Resolved
     # here beside the model because context length is a property OF the model -- a per-call
     # model override must not silently keep the default model's context window.
     # DEFAULT_CONTEXT_TOKENS is discovered once at import for DEFAULT_MODEL, so the common
     # path costs nothing; only a genuine model override pays for a discovery probe.
+    # The identity guard on ``_call_host is _ACTIVE_HOST`` matters: without it,
+    # a same-model fleet (host A + host B both serving qwen3.6:35b at different
+    # num_ctx) reuses the module-active host's context on the wire to the
+    # override host — a silent over-fill exactly of the kind :424 warns against.
     _effective_context_tokens = (
-        DEFAULT_CONTEXT_TOKENS if _effective_model == DEFAULT_MODEL
+        DEFAULT_CONTEXT_TOKENS
+        if (_effective_model == DEFAULT_MODEL and _call_host is _ACTIVE_HOST)
         else _discover_context_tokens(_effective_model, base_url=_call_base)
     )
 

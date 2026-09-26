@@ -220,7 +220,29 @@ class TestConfigRelocation(OllamaOffloadTestCase):
 class TestNonCoincidentModelDiscovery(unittest.TestCase):
     """The stock fixture pins config model == /api/ps == qwen3:8b, so a bug that
     resolves the wrong side of the two would look identical to the fix. These
-    cases pull the two names apart so only ONE order can pass each assertion."""
+    cases pull the two names apart so only ONE order can pass each assertion.
+
+    Two traps the DA pass on the first cut of this class found (aaf11bb → fix):
+      1. ``importlib.reload`` runs ``_discover_model()`` at IMPORT — before any
+         per-test urlopen patch is installed. Without patching first, the
+         module's import-time discovery hits real urllib, resolves against a
+         phony host (DNS fails), and falls back to ``_DEFAULT_MODEL_HINT``. If
+         the fixture /api/ps happens to name the SAME string as the hint, the
+         test passes via the hint — the exact coincidence it claims to exclude.
+      2. Test order was also part of the leak: a sibling test's un-restored
+         urlopen patch (or its absence) changed what the reload saw. Running
+         ``TestFaultSeparation`` right before this class made the test FAIL,
+         proving the pass was leak-dependent.
+    Fix: install urlopen on ``urllib.request`` BEFORE the reload, AND pick a
+    ``/api/ps`` model name that is NOT equal to ``_DEFAULT_MODEL_HINT`` so a
+    hint firing cannot masquerade as a discovery hit.
+    """
+
+    # Deliberately not ``qwen3:8b`` or ``qwen3.6:35b`` (those are, respectively,
+    # the pre-3987814 and post-3987814 values of ``_DEFAULT_MODEL_HINT`` — any
+    # hint fall-through would coincide with one of them and pass the assertion
+    # by accident). ``phony-model:test`` cannot possibly equal the hint.
+    NONCOINCIDENT_MODEL = "phony-model:test"
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -236,14 +258,6 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
         os.environ.update(self._env)
         self._tmp.cleanup()
 
-    def _reload_with_config(self, cfg):
-        path = os.path.join(self._tmp.name, "cfg.json")
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh)
-        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
-        import ollama_offload
-        return importlib.reload(ollama_offload)
-
     def _canned(self, ps_model):
         return {
             "/api/version": VERSION,
@@ -253,34 +267,71 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
             "/api/chat": _chat_response(json.dumps({"ok": True})),
         }
 
+    def _reload_with_config_and_routes(self, cfg, ps_model):
+        """Install the urlopen mock BEFORE ``importlib.reload`` so import-time
+        ``_discover_model()`` probes the fixture rather than real urllib."""
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        sent: list = []
+        urllib.request.urlopen = _routed_urlopen(self._canned(ps_model),
+                                                 record=sent)
+        import ollama_offload
+        return importlib.reload(ollama_offload), sent
+
     def test_discovered_reaches_wire_when_config_omits_model(self):
-        """No config pin: /api/ps says qwen3.6:35b; body must send qwen3.6:35b."""
-        mod = self._reload_with_config({"url": "http://test.invalid:11434/api/chat"})
-        sent = []
-        mod.urllib.request.urlopen = _routed_urlopen(self._canned("qwen3.6:35b"),
-                                                    record=sent)
+        """No config pin: /api/ps says phony-model:test; body must send it.
+
+        With the fixture pulled apart from ``_DEFAULT_MODEL_HINT``, only a
+        genuine discovery hit can satisfy the assertion — a hint fall-through
+        would send ``qwen3.6:35b`` and fail.
+        """
+        mod, sent = self._reload_with_config_and_routes(
+            {"url": "http://test.invalid:11434/api/chat"},
+            ps_model=self.NONCOINCIDENT_MODEL,
+        )
         result = mod.call_ollama("go", schema=SCHEMA)
         chat_bodies = [b for b in sent if "messages" in b]
-        self.assertEqual(chat_bodies[-1]["model"], "qwen3.6:35b",
+        self.assertEqual(chat_bodies[-1]["model"], self.NONCOINCIDENT_MODEL,
                          "with no config pin, the wire body must carry the "
-                         "value discovered from /api/ps")
-        self.assertEqual(result["_meta"]["model"], "qwen3.6:35b")
+                         "value discovered from /api/ps — not the hint fallback")
+        self.assertEqual(result["_meta"]["model"], self.NONCOINCIDENT_MODEL)
 
     def test_config_pin_wins_over_discovered(self):
         """Config pin set to 'explicit-pin'; /api/ps disagrees. Pin must win."""
-        mod = self._reload_with_config({
-            "url": "http://test.invalid:11434/api/chat",
-            "model": "explicit-pin",
-        })
-        sent = []
-        mod.urllib.request.urlopen = _routed_urlopen(self._canned("qwen3.6:35b"),
-                                                    record=sent)
+        mod, sent = self._reload_with_config_and_routes(
+            {"url": "http://test.invalid:11434/api/chat", "model": "explicit-pin"},
+            ps_model=self.NONCOINCIDENT_MODEL,
+        )
         result = mod.call_ollama("go", schema=SCHEMA)
         chat_bodies = [b for b in sent if "messages" in b]
         self.assertEqual(chat_bodies[-1]["model"], "explicit-pin",
                          "a configured model pin must override any discovered "
                          "value on the wire")
         self.assertEqual(result["_meta"]["model"], "explicit-pin")
+
+    def test_env_override_wins_over_config_pin(self):
+        """``OLLAMA_OFFLOAD_MODEL`` per README:136 must override the pin.
+
+        Without this test the F2 defect (pin winning over env) rides forever;
+        the shipped ``ollama_offload_config.json`` pins ``model`` at top level
+        AND per host, so an operator following the README today gets the env
+        var silently ignored.
+        """
+        os.environ["OLLAMA_OFFLOAD_MODEL"] = "env-wins"
+        mod, sent = self._reload_with_config_and_routes(
+            {"url": "http://test.invalid:11434/api/chat", "model": "config-pin"},
+            ps_model=self.NONCOINCIDENT_MODEL,
+        )
+        result = mod.call_ollama("go", schema=SCHEMA)
+        chat_bodies = [b for b in sent if "messages" in b]
+        self.assertEqual(chat_bodies[-1]["model"], "env-wins",
+                         "OLLAMA_OFFLOAD_MODEL must win over a config pin per "
+                         "README:136 — the shipped config pins, so this is the "
+                         "only path the documented override actually reaches")
+        self.assertEqual(result["_meta"]["model"], "env-wins")
 
 
 class TestEnvironmentNamespace(unittest.TestCase):
