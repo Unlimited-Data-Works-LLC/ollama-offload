@@ -168,7 +168,7 @@ The suites mirror each other case for case, and both run fully offline against c
 A test suite that needs a GPU is a suite nobody runs.
 
 ```bash
-python3 -m unittest discover -s tests      # 8 tests
+python3 -m unittest discover -s tests      # 9 tests
 ```
 ```powershell
 Invoke-Pester ./tests                      # 7 tests

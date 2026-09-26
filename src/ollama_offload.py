@@ -52,10 +52,13 @@ _CONFIG_PATH = Path(
 )
 _CONFIG_SCHEMA_PATH = Path(__file__).parent / "ollama_offload_config.schema.json"
 
-# Used only when neither the resolved host entry nor the config's top-level
-# `model` names one, and runtime discovery has not run yet. Discovery from
-# /api/ps and /api/tags supersedes it on every real call.
-_DEFAULT_MODEL_HINT = "qwen3:8b"
+# Used only when runtime discovery in `_discover_model` cannot reach ANY
+# endpoint (both /api/ps and /api/tags failed) AND neither the resolved host
+# entry nor the config's top-level `model` names one. When either the host
+# entry or the top-level config OMITS `model`, `_resolve_active_host` returns
+# None for the model field so `_call_ollama_once` falls through to
+# `DEFAULT_MODEL` (the runtime-discovered value). See :163/:189/:230.
+_DEFAULT_MODEL_HINT = "qwen3.6:35b"
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +163,15 @@ def _resolve_active_host() -> dict:
         return {
             "name": "<env-url>",
             "url": raw_url,
-            "model": _CFG.get("model") or _DEFAULT_MODEL_HINT,
+            # None (config OMITS `model`) preserved through so
+            # `_call_ollama_once` falls through to DEFAULT_MODEL (the runtime-
+            # discovered value from `_discover_model`). Prior shape
+            # `_CFG.get("model") or _DEFAULT_MODEL_HINT` shadowed the
+            # discovered model on every env-URL call — the wire body kept
+            # whatever the config pinned, contradicting the module's own
+            # contract at :12 and README:46-47 (and dropping README:136's
+            # documented OLLAMA_OFFLOAD_MODEL env override).
+            "model": _CFG.get("model"),
             "context_tokens_fallback": _CFG.get("context_tokens_fallback") or 8192,
         }
 
@@ -186,7 +197,12 @@ def _resolve_active_host() -> dict:
     resolved = {
         "name": host_name,
         "url": entry.get("url") or _CFG.get("url") or "http://localhost:11434/api/chat",
-        "model": entry.get("model") or _CFG.get("model") or _DEFAULT_MODEL_HINT,
+        # Preserve None (both entry and config OMIT `model`) through so
+        # `_call_ollama_once` falls through to DEFAULT_MODEL — the runtime-
+        # discovered value from `_discover_model`. Prior shape shadowed the
+        # discovered model with `_DEFAULT_MODEL_HINT` on every call; see
+        # :163 for the same root cause and the module's own contract at :12.
+        "model": entry.get("model") or _CFG.get("model"),
         "context_tokens_fallback": (
             entry.get("context_tokens_fallback")
             or _CFG.get("context_tokens_fallback")
@@ -227,7 +243,8 @@ def _resolve_host_by_name(name: str) -> dict:
     resolved = {
         "name": name,
         "url": entry.get("url") or _CFG.get("url") or "http://localhost:11434/api/chat",
-        "model": entry.get("model") or _CFG.get("model") or _DEFAULT_MODEL_HINT,
+        # Preserve None so `_call_ollama_once` falls to DEFAULT_MODEL. See :163.
+        "model": entry.get("model") or _CFG.get("model"),
         "context_tokens_fallback": (
             entry.get("context_tokens_fallback")
             or _CFG.get("context_tokens_fallback")
