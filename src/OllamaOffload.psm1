@@ -72,9 +72,20 @@ class OllamaConfigError : System.Exception {
 
 # ---- Paths, module-scope cache ---------------------------------------------
 # The module and its config live side by side.
-# Used only when neither the resolved host entry nor the config names a model, and
-# runtime discovery has not run. Discovery from /api/ps and /api/tags supersedes it.
-$Script:DefaultModelHint = 'qwen3:8b'
+# Used only when runtime discovery in `_DiscoverModelForHost` cannot reach ANY
+# endpoint (both /api/ps and /api/tags failed) AND neither the resolved host
+# entry nor the config's top-level `model` names one. When either the host
+# entry or the top-level config OMITS `model`, the resolvers now return $null
+# for the model field so `_InvokeOllamaCallOnce` falls through to per-host
+# discovery (the runtime-discovered value). Python parity: _DEFAULT_MODEL_HINT.
+$Script:DefaultModelHint   = 'qwen3.6:35b'
+# F5: source of the value _Discover / _DiscoverModelForHost most recently
+# returned. Values: 'env', 'ps', 'tags', 'cfg', 'hint', 'unknown'. The call
+# path forces a fresh discovery against the per-call base_url when this is
+# 'hint', so a REACHABLE host that was never asked does not receive the
+# import-time hint's homelab-specific model name. Python parity:
+# _DEFAULT_MODEL_SOURCE (module global).
+$Script:DefaultModelSource = 'unknown'
 # OLLAMA_OFFLOAD_CONFIG relocates the config file, for the case where this module is
 # vendored into another tree read-only and the caller's real hosts must live outside
 # the dependency. Python parity: _CONFIG_PATH reads the same variable.
@@ -209,7 +220,14 @@ function _ResolveHostByName {
     return @{
         Name  = $Name
         Url   = $entry['url'] ?? $cfg['url'] ?? 'http://localhost:11434/api/chat'
-        Model = $entry['model'] ?? $cfg['model'] ?? $script:DefaultModelHint
+        # Preserve $null when both entry and cfg OMIT `model` so
+        # `_InvokeOllamaCallOnce` falls through to per-host runtime
+        # discovery (the discovered value from `_DiscoverModelForHost`).
+        # Prior shape `?? $script:DefaultModelHint` shadowed the discovered
+        # model on every -HostName call and dropped OLLAMA_OFFLOAD_MODEL
+        # precedence. Python parity: _resolve_host_by_name at :246 —
+        # `entry.get("model") or _CFG.get("model")` (no hint fallback).
+        Model = $entry['model'] ?? $cfg['model']
         ContextTokensFallback = $entry['context_tokens_fallback'] ?? $cfg['context_tokens_fallback'] ?? 8192
     }
 }
@@ -261,18 +279,39 @@ function _Discover {
     $hint    = $cfg['model']                                        # config's preferred model (hint)
     $fallbk  = [int]($cfg['context_tokens_fallback'] ?? 8192)
 
+    # F5: OLLAMA_OFFLOAD_MODEL env override wins at discovery (parity with
+    # Python `_discover_model`). Also stamps $Script:DefaultModelSource so
+    # the per-call ladder in `_InvokeOllamaCallOnce` can tell where the
+    # active-host model came from.
+    $envOverride = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
+    $modelName   = $null
+    if ($envOverride) {
+        $modelName = $envOverride
+        $Script:DefaultModelSource = 'env'
+    }
+
     # If no hint, ask /api/ps for currently-loaded models and pick first.
-    $modelName = $hint
+    if (-not $modelName) {
+        $modelName = $hint
+        if ($modelName) { $Script:DefaultModelSource = 'cfg' }
+    }
     try {
         if (-not $modelName) {
             $ps = Invoke-RestMethod -Method Get -Uri "$baseUrl/api/ps" -TimeoutSec 8
-            if ($ps.models -and $ps.models.Count -gt 0) { $modelName = $ps.models[0].name }
+            if ($ps.models -and $ps.models.Count -gt 0) {
+                $modelName = $ps.models[0].name
+                $Script:DefaultModelSource = 'ps'
+            }
         }
     } catch { }   # fall through — will error at /api/show below if truly unreachable
 
     if (-not $modelName) {
-        # Ollama unreachable at discovery. Fall back to config hint OR raise.
-        throw [OllamaUnavailable]::new("Cannot discover a model (no /api/ps hit, no config 'model' hint)")
+        # F5: nothing chose a model. Match Python — fall back to the hardcoded
+        # hint + stamp the source so the per-call ladder can force a fresh
+        # discovery against the resolved per-call base_url. Prior shape
+        # raised OllamaUnavailable here, but that pre-empts F5's retry.
+        $modelName = $Script:DefaultModelHint
+        $Script:DefaultModelSource = 'hint'
     }
 
     try {
@@ -361,6 +400,96 @@ function _Discover {
 
     $Script:Discovered = @{ Model = $modelName; ContextTokens = $ctxTokens; KeepAlive = $keepAlive; BaseUrl = $baseUrl }
     return $Script:Discovered
+}
+
+# ---- Per-host discovery helpers (F3: base_url threading) -------------------
+# Twins of Python `_discover_model(base_url=)` + `_discover_context_tokens(base_url=)`.
+# UNCACHED, one probe per call: caching would defeat per-host discovery when
+# `-HostName` targets a host that is NOT the module-active one. The active-
+# host path continues to use `_Discover` (cached module-scope) — these helpers
+# only fire when the ladder in `_InvokeOllamaCallOnce` needs a fresh probe
+# against a resolved per-call base_url.
+function _DiscoverModelForHost {
+    param([Parameter(Mandatory)] [string]$BaseUrl)
+    # Env override wins (parity with `_Discover` above).
+    $envOverride = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
+    if ($envOverride) {
+        $Script:DefaultModelSource = 'env'
+        return $envOverride
+    }
+    # PRIMARY: /api/ps — models currently loaded (authoritative "serving now").
+    try {
+        $ps = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/ps" -TimeoutSec 5
+        if ($ps -and $ps.models -and @($ps.models).Count -gt 0) {
+            $Script:DefaultModelSource = 'ps'
+            return $ps.models[0].name
+        }
+    } catch { }
+    # SECONDARY: /api/tags — all installed models. First-in-list heuristic
+    # (Python picks by size; PS stays with the current /api/ps first-item
+    # heuristic for parity with _Discover's existing behavior).
+    try {
+        $tags = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/tags" -TimeoutSec 5
+        if ($tags -and $tags.models -and @($tags.models).Count -gt 0) {
+            $Script:DefaultModelSource = 'tags'
+            return $tags.models[0].name
+        }
+    } catch { }
+    # Everything failed — fall back to config pin, then hardcoded hint.
+    $cfg = Get-OllamaConfig
+    $cfgPin = $cfg['model']
+    if ($cfgPin) {
+        $Script:DefaultModelSource = 'cfg'
+        return $cfgPin
+    }
+    $Script:DefaultModelSource = 'hint'
+    return $Script:DefaultModelHint
+}
+
+function _DiscoverContextTokensForHost {
+    # F4: context tokens keyed to (model, base_url) tuple, not `model` alone.
+    # A same-model fleet (host A + host B both serving qwen3:8b at different
+    # num_ctx) MUST NOT reuse the module-active host's context on the wire
+    # to the override host — that is the silent over-fill this fix closes.
+    param(
+        [Parameter(Mandatory)] [string]$Model,
+        [Parameter(Mandatory)] [string]$BaseUrl
+    )
+    $cfg = Get-OllamaConfig
+    $fallbk = [int]($cfg['context_tokens_fallback'] ?? 8192)
+
+    # Env override.
+    $envCtx = _EnvOr 'OLLAMA_OFFLOAD_CONTEXT_TOKENS' $null
+    if ($envCtx) {
+        try { return [int]$envCtx } catch { }
+    }
+
+    # PRIMARY: /api/ps — the LOADED runtime context (what actually gets served).
+    try {
+        $ps = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/ps" -TimeoutSec 5
+        if ($null -ne $ps -and $ps.PSObject.Properties.Name -contains 'models') {
+            foreach ($m in $ps.models) {
+                if (($m.name -eq $Model -or $m.model -eq $Model) -and
+                    $m.PSObject.Properties.Name -contains 'context_length') {
+                    return [int]$m.context_length
+                }
+            }
+        }
+    } catch { }
+
+    # FALLBACK: /api/show num_ctx from parameters text.
+    try {
+        $show = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/show" `
+                    -ContentType 'application/json' `
+                    -Body (@{ model = $Model } | ConvertTo-Json) -TimeoutSec 5
+        $paramText = if ($show.PSObject.Properties.Name -contains 'parameters') { $show.parameters } else { $null }
+        if ($paramText -is [string] -and $paramText) {
+            $m = [regex]::Match($paramText, '(?m)^\s*num_ctx\s+(\d+)\s*$')
+            if ($m.Success) { return [int]$m.Groups[1].Value }
+        }
+    } catch { }
+
+    return $fallbk
 }
 
 # ---- P1 — Byte budget derived from live context, not literal ---------------
@@ -533,32 +662,83 @@ function _InvokeOllamaCallOnce {
     $cooldownOnFail = [int](_EnvOr 'OLLAMA_OFFLOAD_COOLDOWN_S' ($cfg['cooldown_on_fail_s'] ?? 300))
     $callTimeout  = [int](_EnvOr 'OLLAMA_OFFLOAD_CALL_TIMEOUT_S' ($cfg['timeout_s'] ?? 180))
 
-    # per-call host resolution +
-    # discovery gating. Two MFs from db-sme forced the restructure below:
-    #   MF-1: `_Discover` was called unconditionally + reads the MODULE
-    #         active host — an unreachable module host blocked a valid
-    #         `-HostName` escape hatch with `OllamaUnavailable`, killing
-    #         the exact failover the per-call host override was meant to enable.
-    #   MF-2: `num_ctx` sourced from `$d.ContextTokens` (module discovery)
-    #         on the `-HostName` path — wrong context window when the
-    #         per-call host serves a different model.
-    # Fold: skip `_Discover` on `-HostName` path; use the per-call host's
-    # ContextTokensFallback + KeepAlive-less body (defaults are fine for
-    # the ad-hoc use case). Python twin parity: `call_ollama(host=...)`
-    # never calls the discovery helpers.
+    # Model resolution ladder (F1-F5, Python parity `_call_ollama_once`:711).
+    # Precedence (highest first):
+    #   1. -Model per-call arg — caller's explicit intent
+    #   2. OLLAMA_OFFLOAD_MODEL env — ops override / CI pin (F2)
+    #   3. per-host config pin `hosts.<name>.model`
+    #   4. per-host runtime discovery (F3) — probes the RESOLVED host, not
+    #      the module-active one, so a `-HostName` escape hatch or failover
+    #      does not receive the active host's discovered model
+    #   5. F5 hint fallback: when active discovery fell to hint, retry against
+    #      per-call base_url; if still hint, raise OllamaCallError
+    #   6. active-host default from `_Discover` (module cache)
+    #
+    # Context-tokens F4 identity guard: when the effective model is
+    # DEFAULT_MODEL *and* the call host is the module-active host, reuse the
+    # cached ContextTokens; otherwise probe (model, base_url) fresh so a
+    # same-model fleet at different num_ctx does not over-fill the wire.
+    $envModelOverride = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
     $keepAlive = '5m'
+    $activeHost = _ResolveActiveHost
     if ($HostName) {
-        $callHost              = _ResolveHostByName -Name $HostName
-        $callChatUrl           = $callHost.Url
-        $effectiveModel        = $callHost.Model
-        $effectiveContextTokens = [int]$callHost.ContextTokensFallback
+        # Per-call host override — skip module `_Discover` (that would probe
+        # the WRONG host + block a valid failover on OllamaUnavailable).
+        $callHost    = _ResolveHostByName -Name $HostName
+        $callChatUrl = $callHost.Url
+        $callBase    = ($callChatUrl -replace '/api/[^/]+/?$', '')
+        if ($Model) {
+            $effectiveModel = $Model
+        } elseif ($envModelOverride) {
+            $effectiveModel = $envModelOverride
+        } elseif ($callHost.Model) {
+            $effectiveModel = $callHost.Model
+        } else {
+            # F3: probe THIS host, not the module-active one. Sets
+            # $Script:DefaultModelSource so the F5 retry can see 'hint'.
+            $effectiveModel = _DiscoverModelForHost -BaseUrl $callBase
+        }
+        # F4: context tokens keyed to (model, per-call base_url). Fallback
+        # to $callHost.ContextTokensFallback ONLY when the probe returned
+        # <= 0 (the helper already applies fallback internally).
+        $effectiveContextTokens = _DiscoverContextTokensForHost -Model $effectiveModel -BaseUrl $callBase
+        if ($effectiveContextTokens -le 0) { $effectiveContextTokens = [int]$callHost.ContextTokensFallback }
     } else {
-        $d = _Discover     # may throw OllamaUnavailable — only when NOT overriding
-        $callHost              = _ResolveActiveHost
-        $callChatUrl           = "$($d.BaseUrl)/api/chat"
-        $effectiveModel        = $d.Model
-        $effectiveContextTokens = [int]$d.ContextTokens
-        $keepAlive             = $d.KeepAlive
+        # Active-host path — `_Discover` caches module-scope. Only probe
+        # freshly if the ladder chooses a model that _Discover did not pick.
+        $d = _Discover     # may throw OllamaUnavailable
+        $callHost    = $activeHost
+        $callChatUrl = "$($d.BaseUrl)/api/chat"
+        $callBase    = $d.BaseUrl
+        if ($Model) {
+            $effectiveModel = $Model
+        } elseif ($envModelOverride) {
+            $effectiveModel = $envModelOverride
+        } elseif ($Script:DefaultModelSource -eq 'hint') {
+            # F5: active-host import-time discovery fell back to the
+            # hardcoded hint. Retry against the resolved base before shipping
+            # a probably-wrong homelab name. Parity note: the Python twin
+            # raises OllamaCallError when the retry ALSO returns 'hint'; the
+            # bug-compat mirror follows Python's current behavior — a fix
+            # commit is pending upstream and will need re-porting.
+            $effectiveModel = _DiscoverModelForHost -BaseUrl $callBase
+            if ($Script:DefaultModelSource -eq 'hint') {
+                throw [OllamaCallError]::new(
+                    "model discovery fell back to `$Script:DefaultModelHint for host=$($callHost.Name) at $callBase. " +
+                    "Set OLLAMA_OFFLOAD_MODEL, add ``model`` to the host entry, or ensure /api/ps + /api/tags " +
+                    "answer with an installed model before calling.")
+            }
+        } else {
+            $effectiveModel = $d.Model
+        }
+        # F4 identity guard: reuse cached ContextTokens only when both model
+        # AND host match the active-cache tuple.
+        if ($effectiveModel -eq $d.Model) {
+            $effectiveContextTokens = [int]$d.ContextTokens
+        } else {
+            $effectiveContextTokens = _DiscoverContextTokensForHost -Model $effectiveModel -BaseUrl $callBase
+        }
+        $keepAlive = $d.KeepAlive
     }
 
     # per-host cooldown check keyed on the RESOLVED
