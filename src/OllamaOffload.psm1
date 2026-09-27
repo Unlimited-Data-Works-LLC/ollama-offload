@@ -95,6 +95,18 @@ $Script:CooldownPath = Join-Path $env:TEMP 'ollama_offload_cooldown.until'   # S
 $Script:Discovered   = $null     # cached { Model, ContextTokens, KeepAlive, BaseUrl }
 $Script:CachedConfig = $null
 $Script:ActiveHost   = $null     # cached { Name, Url } — resolved once per process
+# DA-round4 (B) mirror of 02e04db: serialize the F5 refresh block in
+# `_InvokeOllamaCallOnce` so a concurrent reader between the .Model write
+# and the .ContextTokens write cannot observe (new_model, old_tokens). The
+# block probes context into a LOCAL first (up to ~10s of wall time on the
+# /api/ps + /api/show fetch) and then commits BOTH writes under this lock,
+# making the observable transition atomic across concurrent writers. Readers
+# (`Get-OllamaContextBytes`, the F4 identity guard) stay lock-free — .NET
+# single-reference writes are atomic on a 64-bit host and the homelab
+# consumer is single-threaded in practice; the lock is defense against a
+# future async caller pattern, not a correctness dependency of the hot path.
+# Python parity: `_F5_REFRESH_LOCK = threading.Lock()`.
+$Script:F5RefreshLock = [System.Threading.SemaphoreSlim]::new(1, 1)
 
 # ---- Config loader (SSOT: ollama_offload_config.json) -----------------------
 function Get-OllamaConfig {
@@ -452,17 +464,22 @@ function _DiscoverModelForHost {
     return $Script:DefaultModelHint
 }
 
-function _DiscoverContextTokensForHost {
-    # F4: context tokens keyed to (model, base_url) tuple, not `model` alone.
-    # A same-model fleet (host A + host B both serving qwen3:8b at different
-    # num_ctx) MUST NOT reuse the module-active host's context on the wire
-    # to the override host — that is the silent over-fill this fix closes.
+function _ProbeContextTokensForHostStrict {
+    # DA-round4 (A) mirror of 02e04db: STRICT context probe. Returns the
+    # discovered runtime context on success, or $null when the probe would
+    # have fallen through to `context_tokens_fallback`. Distinguishes the
+    # fallback CONSTANT from a real discovered value that happens to equal
+    # it — so the F5 refresh at :~776 can SKIP the write instead of
+    # clobbering a possibly-more-accurate import-time cached ContextTokens
+    # with the fallback (an identity-match on the constant would false-
+    # positive whenever /api/ps genuinely reports 8192 as the loaded
+    # num_ctx). `_DiscoverContextTokensForHost` wraps this and applies the
+    # fallback for callers that still want an int. Python parity:
+    # `_probe_context_tokens_strict`.
     param(
         [Parameter(Mandatory)] [string]$Model,
         [Parameter(Mandatory)] [string]$BaseUrl
     )
-    $cfg = Get-OllamaConfig
-    $fallbk = [int]($cfg['context_tokens_fallback'] ?? 8192)
 
     # Env override.
     $envCtx = _EnvOr 'OLLAMA_OFFLOAD_CONTEXT_TOKENS' $null
@@ -483,7 +500,7 @@ function _DiscoverContextTokensForHost {
         }
     } catch { }
 
-    # FALLBACK: /api/show num_ctx from parameters text.
+    # FALLBACK PROBE: /api/show num_ctx from parameters text.
     try {
         $show = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/show" `
                     -ContentType 'application/json' `
@@ -495,6 +512,28 @@ function _DiscoverContextTokensForHost {
         }
     } catch { }
 
+    return $null
+}
+
+function _DiscoverContextTokensForHost {
+    # F4: context tokens keyed to (model, base_url) tuple, not `model` alone.
+    # A same-model fleet (host A + host B both serving qwen3:8b at different
+    # num_ctx) MUST NOT reuse the module-active host's context on the wire
+    # to the override host — that is the silent over-fill this fix closes.
+    #
+    # DA-round4 (A) mirror of 02e04db: wraps `_ProbeContextTokensForHostStrict`
+    # and applies `$cfg.context_tokens_fallback` on the strict-$null path.
+    # Callers that must DISTINGUISH the fallback constant from a genuine
+    # discovered value (the F5 refresh at :~776 does) call the strict form
+    # directly. Python parity: `_discover_context_tokens`.
+    param(
+        [Parameter(Mandatory)] [string]$Model,
+        [Parameter(Mandatory)] [string]$BaseUrl
+    )
+    $cfg = Get-OllamaConfig
+    $fallbk = [int]($cfg['context_tokens_fallback'] ?? 8192)
+    $got = _ProbeContextTokensForHostStrict -Model $Model -BaseUrl $BaseUrl
+    if ($null -ne $got) { return [int]$got }
     return $fallbk
 }
 
@@ -759,7 +798,7 @@ function _InvokeOllamaCallOnce {
             # below (`$effectiveModel = $d.Model`) and ships the stale hint
             # — the sticky-hint regression 70e0f3c left in. Python parity:
             # `global DEFAULT_MODEL; DEFAULT_MODEL = _effective_model`.
-            $Script:Discovered.Model = $effectiveModel
+            #
             # 872de70 (A) mirror: also refresh ContextTokens. Because
             # `_Discover` returns `$Script:Discovered` by REFERENCE, the
             # local `$d.Model` above just flipped to `$effectiveModel` and
@@ -769,11 +808,38 @@ function _InvokeOllamaCallOnce {
             # against this host. Without refreshing it, the import-time
             # hint-era num_ctx (possibly 8192 fallback or an /api/show
             # architectural value for a model that isn't even loaded on the
-            # recovered host) travels forever. Same host we just retried
-            # against — safe to probe again; `_DiscoverContextTokensForHost`
-            # fails-open to `$cfg.context_tokens_fallback` on any throw and
-            # never re-enters `_InvokeOllamaCallOnce` or `_DiscoverModelForHost`.
-            $Script:Discovered.ContextTokens = _DiscoverContextTokensForHost -Model $effectiveModel -BaseUrl $callBase
+            # recovered host) travels forever.
+            #
+            # DA-round4 (A+B) mirror of 02e04db: probe context into a LOCAL
+            # first (the /api/ps + /api/show probes are up to ~10s of wall
+            # time), THEN commit both writes together under
+            # $Script:F5RefreshLock. Two coupled fixes:
+            #   A — `_ProbeContextTokensForHostStrict` returns $null when the
+            #       probe fell through to the fallback constant (transient
+            #       /api/show error, model not in /api/ps yet). Writing that
+            #       fallback back to $Script:Discovered.ContextTokens would
+            #       CLOBBER a possibly-more-accurate import-time value.
+            #       Skip the write on the strict-$null signal.
+            #   B — the prior shape wrote .Model, then BLOCKED up to ~10s
+            #       inside `_DiscoverContextTokensForHost`, then wrote
+            #       .ContextTokens. A concurrent reader between the two
+            #       writes saw (new_model, old_tokens). Probe-into-local
+            #       FIRST (before taking the lock, since the network call
+            #       is long), then commit both writes under the lock so a
+            #       concurrent writer cannot interleave the pair.
+            # Python parity: `_new_ctx = _probe_context_tokens_strict(...);
+            # with _F5_REFRESH_LOCK: DEFAULT_MODEL = _effective_model;
+            # if _new_ctx is not None: DEFAULT_CONTEXT_TOKENS = _new_ctx`.
+            $newCtx = _ProbeContextTokensForHostStrict -Model $effectiveModel -BaseUrl $callBase
+            $Script:F5RefreshLock.Wait()
+            try {
+                $Script:Discovered.Model = $effectiveModel
+                if ($null -ne $newCtx) {
+                    $Script:Discovered.ContextTokens = [int]$newCtx
+                }
+            } finally {
+                [void]$Script:F5RefreshLock.Release()
+            }
         } else {
             $effectiveModel = $d.Model
         }

@@ -173,25 +173,46 @@ Describe 'OllamaOffload' {
             }
         }
 
-        It 'treats whitespace-only OLLAMA_OFFLOAD_MODEL as UNSET' {
-            Mock -ModuleName OllamaOffload Invoke-RestMethod {
-                if ($Uri -like '*/api/ps')   { return $script:Ps }
-                if ($Uri -like '*/api/show') { return $script:Show }
-                if ($Uri -like '*/api/tags') { return $script:Tags }
-                if ($Uri -like '*/api/chat') {
-                    [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
-                    return (New-ChatResponse -Content '{"ok":true}')
+        It 'treats whitespace-only OLLAMA_OFFLOAD_MODEL as UNSET (tab/newline/NBSP/mixed)' {
+            # DA-round4 (C) mirror of 02e04db: the whitespace category is not
+            # one input but a family (spaces, tab, newline, NBSP, mixed). A
+            # refactor to a hand-rolled strip on " `t`n" alone would leak
+            # NBSP; parametrization catches it. .NET String.Trim() (the .Trim()
+            # in the ladder) considers `[char]0x00A0` whitespace because
+            # `Char.IsWhiteSpace` returns true for it — parity with Python's
+            # `str.strip()` covering NBSP.
+            foreach ($case in @(
+                @{ Label = 'spaces';  Value = '   ' },
+                @{ Label = 'tab';     Value = "`t" },
+                @{ Label = 'newline'; Value = "`n" },
+                @{ Label = 'nbsp';    Value = [string][char]0x00A0 },
+                @{ Label = 'mixed';   Value = " `t `n " }
+            )) {
+                # Fresh module + mocks per sub-case so `$Script:DefaultModelSource`
+                # state does not leak between cases (parity with Python's
+                # `importlib.reload` per subtest).
+                Remove-Module OllamaOffload -Force -ErrorAction SilentlyContinue
+                Import-Module $script:ModulePath -Force
+                Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                    if ($Uri -like '*/api/ps')   { return $script:Ps }
+                    if ($Uri -like '*/api/show') { return $script:Show }
+                    if ($Uri -like '*/api/tags') { return $script:Tags }
+                    if ($Uri -like '*/api/chat') {
+                        [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
+                        return (New-ChatResponse -Content '{"ok":true}')
+                    }
+                    throw "no fixture for $Uri"
                 }
-                throw "no fixture for $Uri"
-            }
-            $script:Sent = [System.Collections.ArrayList]::new()
-            $env:OLLAMA_OFFLOAD_MODEL = '   '
-            try {
-                $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
-                Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
-                $script:Sent[-1].model | Should -Be 'qwen3:8b'
-            } finally {
-                Remove-Item Env:OLLAMA_OFFLOAD_MODEL -ErrorAction SilentlyContinue
+                $script:Sent = [System.Collections.ArrayList]::new()
+                $env:OLLAMA_OFFLOAD_MODEL = $case.Value
+                try {
+                    $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+                    Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+                    $script:Sent[-1].model | Should -Be 'qwen3:8b' `
+                        -Because "whitespace-only env ($($case.Label)) must be UNSET after strip; /api/ps discovery must win — the wire body must NOT ship '$($case.Value)'"
+                } finally {
+                    Remove-Item Env:OLLAMA_OFFLOAD_MODEL -ErrorAction SilentlyContinue
+                }
             }
         }
 
@@ -276,6 +297,68 @@ Describe 'OllamaOffload' {
             Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
             $script:Sent[-1].options.num_ctx | Should -Be 8192 -Because 'without the sibling refresh, call 2 would ship the stale 262144 via the F4 shortcut'
             $script:Sent[-1].options.num_ctx | Should -Not -Be 262144
+        }
+    }
+
+    Context 'F5 refresh commits Model + ContextTokens atomically (02e04db B)' {
+
+        It 'transitions Get-OllamaContextBytes across F5 refresh without a torn read' {
+            # DA-round4 (D) mirror of 02e04db: Get-OllamaContextBytes reads
+            # $Script:Discovered.ContextTokens lock-free. Under Fix B the F5
+            # refresh commits .Model and .ContextTokens together under
+            # $Script:F5RefreshLock, so successive reads observe (old, old)
+            # or (new, new) — never a torn (new_model, old_tokens). Snapshot
+            # `Get-OllamaContextBytes 0.5` at THREE points: pre-recovery
+            # (hint-era 262144 primed on the cache), post-first-call (F5
+            # flip to the recovered 8192 from /api/ps), post-second-call
+            # (stable at 8192 — F5 branch skipped because source is no
+            # longer 'hint'). Assert the transition happened once and later
+            # reads are consistent.
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') {
+                    [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
+                    return (New-ChatResponse -Content '{"ok":true}')
+                }
+                throw "no fixture for $Uri"
+            }
+            $script:Sent = [System.Collections.ArrayList]::new()
+            InModuleScope OllamaOffload {
+                # Prime the cache with the hint-era shape so the F5 branch
+                # fires on the next call — Model = hardcoded hint,
+                # ContextTokens = the /api/show architectural 262144.
+                $Script:Discovered = @{
+                    Model = $Script:DefaultModelHint
+                    ContextTokens = 262144
+                    KeepAlive = '5m'
+                    BaseUrl = 'http://test.invalid:11434'
+                }
+                $Script:DefaultModelSource = 'hint'
+            }
+            # Point 1: post-prime — reader sees the hint-era 262144.
+            $cbImport = Get-OllamaContextBytes -Ratio 0.5
+            $cbImport | Should -Be ([int](262144 * 0.5 * 4)) `
+                -Because 'point 1: pre-recovery context_bytes reflects the primed hint-era ContextTokens (262144)'
+
+            $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+            # Point 2: post-first-call — F5 flipped both under the lock;
+            # /api/ps reports context_length = 8192 for qwen3:8b.
+            $cbAfterFlip = Get-OllamaContextBytes -Ratio 0.5
+            $cbAfterFlip | Should -Be ([int](8192 * 0.5 * 4)) `
+                -Because 'point 2: post-first-call context_bytes reflects the F5-refreshed runtime value (8192) — the flip must be observable by the same reader that saw the hint-era value'
+            $cbAfterFlip | Should -Not -Be $cbImport `
+                -Because 'the transition must have happened — otherwise the refresh path is inert'
+
+            # Second call: F5 branch skipped now (source != 'hint'); value
+            # must remain stable across the F4 identity-guard shortcut.
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+            $cbStable = Get-OllamaContextBytes -Ratio 0.5
+            # Point 3: post-second-call — no further refresh, value stable.
+            $cbStable | Should -Be $cbAfterFlip `
+                -Because 'point 3: post-second-call context_bytes must match point 2 — no further F5 refresh runs because $Script:DefaultModelSource is no longer ''hint''; readers see a stable value across the lock boundary'
         }
     }
 
