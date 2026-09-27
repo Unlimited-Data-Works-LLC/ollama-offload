@@ -146,6 +146,78 @@ Describe 'OllamaOffload' {
         }
     }
 
+    Context 'OLLAMA_OFFLOAD_MODEL empty / whitespace is UNSET (c0961a3 i+v)' {
+
+        It 'treats OLLAMA_OFFLOAD_MODEL = "" as UNSET (falls through to /api/ps discovery)' {
+            # Parity with Python test_empty_string_env_is_unset. An empty-string
+            # env override must NOT ship '' as the model; the ladder must fall
+            # through to /api/ps discovery.
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') {
+                    [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
+                    return (New-ChatResponse -Content '{"ok":true}')
+                }
+                throw "no fixture for $Uri"
+            }
+            $script:Sent = [System.Collections.ArrayList]::new()
+            $env:OLLAMA_OFFLOAD_MODEL = ''
+            try {
+                $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+                Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+                $script:Sent[-1].model | Should -Be 'qwen3:8b' -Because 'empty env must not ship as model; /api/ps must win'
+            } finally {
+                Remove-Item Env:OLLAMA_OFFLOAD_MODEL -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'treats whitespace-only OLLAMA_OFFLOAD_MODEL as UNSET' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') {
+                    [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
+                    return (New-ChatResponse -Content '{"ok":true}')
+                }
+                throw "no fixture for $Uri"
+            }
+            $script:Sent = [System.Collections.ArrayList]::new()
+            $env:OLLAMA_OFFLOAD_MODEL = '   '
+            try {
+                $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+                Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+                $script:Sent[-1].model | Should -Be 'qwen3:8b'
+            } finally {
+                Remove-Item Env:OLLAMA_OFFLOAD_MODEL -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'strips surrounding whitespace from a real OLLAMA_OFFLOAD_MODEL value' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') {
+                    [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
+                    return (New-ChatResponse -Content '{"ok":true}')
+                }
+                throw "no fixture for $Uri"
+            }
+            $script:Sent = [System.Collections.ArrayList]::new()
+            $env:OLLAMA_OFFLOAD_MODEL = '  qwen3:8b  '
+            try {
+                $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+                Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+                $script:Sent[-1].model | Should -Be 'qwen3:8b' -Because 'the ladder must strip before shipping'
+            } finally {
+                Remove-Item Env:OLLAMA_OFFLOAD_MODEL -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     Context 'environment namespace' {
 
         It 'never reads Ollama own variables' {

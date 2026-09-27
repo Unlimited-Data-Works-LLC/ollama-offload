@@ -283,7 +283,11 @@ function _Discover {
     # Python `_discover_model`). Also stamps $Script:DefaultModelSource so
     # the per-call ladder in `_InvokeOllamaCallOnce` can tell where the
     # active-host model came from.
+    # c0961a3 (i/v): strip on read so a whitespace-bearing env value
+    # ("  qwen3:8b  ") does not ship to Ollama and 404; empty-after-strip
+    # falls through as UNSET (truthy check below treats '' as $false).
     $envOverride = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
+    if ($envOverride) { $envOverride = $envOverride.Trim() }
     $modelName   = $null
     if ($envOverride) {
         $modelName = $envOverride
@@ -412,7 +416,9 @@ function _Discover {
 function _DiscoverModelForHost {
     param([Parameter(Mandatory)] [string]$BaseUrl)
     # Env override wins (parity with `_Discover` above).
+    # c0961a3 (i/v): strip on read; empty-after-strip = UNSET.
     $envOverride = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
+    if ($envOverride) { $envOverride = $envOverride.Trim() }
     if ($envOverride) {
         $Script:DefaultModelSource = 'env'
         return $envOverride
@@ -678,7 +684,9 @@ function _InvokeOllamaCallOnce {
     # DEFAULT_MODEL *and* the call host is the module-active host, reuse the
     # cached ContextTokens; otherwise probe (model, base_url) fresh so a
     # same-model fleet at different num_ctx does not over-fill the wire.
+    # c0961a3 (i/v): strip on read; empty-after-strip = UNSET so the ladder falls through.
     $envModelOverride = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
+    if ($envModelOverride) { $envModelOverride = $envModelOverride.Trim() }
     $keepAlive = '5m'
     $activeHost = _ResolveActiveHost
     if ($HostName) {
@@ -697,6 +705,19 @@ function _InvokeOllamaCallOnce {
             # F3: probe THIS host, not the module-active one. Sets
             # $Script:DefaultModelSource so the F5 retry can see 'hint'.
             $effectiveModel = _DiscoverModelForHost -BaseUrl $callBase
+            # c0961a3 (ii): F3 hint-guard. cfdcff9 restored this branch but
+            # left it fail-open: _DiscoverModelForHost returns DefaultModelHint
+            # if /api/ps AND /api/tags both fail on the secondary too. The F5
+            # elif below never fires (F3 already matched), so the hint would
+            # ship. Mirror the F5 raise: if source is 'hint' after this probe,
+            # the reachable secondary could not answer — raise OllamaUnavailable
+            # so the failover orchestrator walks to the next host.
+            if ($Script:DefaultModelSource -eq 'hint') {
+                throw [OllamaUnavailable]::new(
+                    "model discovery fell back to `$Script:DefaultModelHint for host=$($callHost.Name) at $callBase. " +
+                    "Set OLLAMA_OFFLOAD_MODEL, add ``model`` to the host entry, or ensure /api/ps + /api/tags " +
+                    "answer with an installed model before calling.")
+            }
         }
         # F4: context tokens keyed to (model, per-call base_url). Fallback
         # to $callHost.ContextTokensFallback ONLY when the probe returned
@@ -723,11 +744,22 @@ function _InvokeOllamaCallOnce {
             # commit is pending upstream and will need re-porting.
             $effectiveModel = _DiscoverModelForHost -BaseUrl $callBase
             if ($Script:DefaultModelSource -eq 'hint') {
-                throw [OllamaCallError]::new(
+                # c0961a3 (iii): was OllamaCallError; the failover orchestrator
+                # in Invoke-OllamaCall only catches OllamaUnavailable to walk
+                # the chain. A hint-fallback on the primary must let the
+                # failover chain be walked, not bubble as an unrecoverable
+                # call error. Python parity: raise OllamaUnavailable.
+                throw [OllamaUnavailable]::new(
                     "model discovery fell back to `$Script:DefaultModelHint for host=$($callHost.Name) at $callBase. " +
                     "Set OLLAMA_OFFLOAD_MODEL, add ``model`` to the host entry, or ensure /api/ps + /api/tags " +
                     "answer with an installed model before calling.")
             }
+            # c0961a3 (ii CRITICAL): retry succeeded. Refresh the module
+            # cache too, or the NEXT call falls through to the else-branch
+            # below (`$effectiveModel = $d.Model`) and ships the stale hint
+            # — the sticky-hint regression 70e0f3c left in. Python parity:
+            # `global DEFAULT_MODEL; DEFAULT_MODEL = _effective_model`.
+            $Script:Discovered.Model = $effectiveModel
         } else {
             $effectiveModel = $d.Model
         }
