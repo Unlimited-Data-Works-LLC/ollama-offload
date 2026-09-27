@@ -427,6 +427,112 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
         self.assertNotEqual(chat2["model"], mod._DEFAULT_MODEL_HINT,
                             "call 2 must NOT ship the sticky hint")
 
+    def test_whitespace_only_env_falls_through_to_config_pin(self):
+        """DA-round3 (B): whitespace-only OLLAMA_OFFLOAD_MODEL ('   ') must
+        fall through to the config pin, not ship as the wire model. The
+        `.strip()` at :751 (and :378) collapses it to '' -> falsy -> pin
+        wins. Empty-string is already locked by
+        `test_empty_string_env_is_unset_not_win`; whitespace-only is a
+        distinct input class that a refactor removing either `.strip()`
+        call would silently ship as-is -> 404 on the wire."""
+        os.environ["OLLAMA_OFFLOAD_MODEL"] = "   "
+        mod, sent = self._reload_with_config_and_routes(
+            {"url": "http://test.invalid:11434/api/chat", "model": "config-pin"},
+            ps_model=self.NONCOINCIDENT_MODEL,
+        )
+        mod.call_ollama("go", schema=SCHEMA)
+        chat_bodies = [b for b in sent if "messages" in b]
+        self.assertEqual(chat_bodies[-1]["model"], "config-pin",
+                         "whitespace-only env is UNSET after strip; the "
+                         "config pin must win")
+
+    def test_discover_model_strips_env_override_directly(self):
+        """DA-round3 (C): the `.strip()` at :378 in `_discover_model` is
+        not directly test-locked — the end-to-end wire tests all traverse
+        `_call_ollama_once` at :751, which strips independently. If a
+        refactor removes :378's strip while :751 stays, wire bodies stay
+        clean but `_DEFAULT_MODEL_SOURCE == "env"` after a call to
+        `_discover_model` returns the UNSTRIPPED value — silent drift for
+        any consumer that reads DEFAULT_MODEL / calls _discover_model."""
+        os.environ["OLLAMA_OFFLOAD_MODEL"] = "  env-wins  "
+        mod, _sent = self._reload_with_config_and_routes(
+            {"url": "http://test.invalid:11434/api/chat", "model": "config-pin"},
+            ps_model=self.NONCOINCIDENT_MODEL,
+        )
+        self.assertEqual(mod._discover_model(), "env-wins",
+                         "_discover_model must strip the env override on read")
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "env")
+
+    def test_default_context_tokens_refreshed_after_import_hint_fallback(self):
+        """DA-round3 (A): post-c0961a3 the num_ctx shortcut at :818 fires
+        on every subsequent same-host call, because the F5 branch above
+        rewrites DEFAULT_MODEL to equal _effective_model on retry success
+        -- the guard `_effective_model == DEFAULT_MODEL` is TRUE by
+        construction from call 2 onward. If DEFAULT_CONTEXT_TOKENS is not
+        ALSO refreshed on that F5 success, the shortcut ships the
+        IMPORT-TIME context window (discovered against the HINT model,
+        possibly the 8192 fallback or an architectural /api/show value
+        for a model that isn't even loaded on the recovered host) on
+        every wire body from call 2 forward -- silent truncation or
+        over-fill against the real serving model."""
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        # Same import-time-dead pattern as
+        # `test_default_model_refreshed_after_import_hint_fallback`:
+        # /api/ps + /api/tags fail so _discover_model hits the hint;
+        # /api/show still answers so _discover_context_tokens at import
+        # returns the architectural value from model_info (262144 from
+        # the SHOW fixture's qwen3.context_length).
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down at import"),
+            "/api/tags": urllib.error.URLError("primary down at import"),
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "hint",
+                         "precondition: import-time discovery hit the hint")
+        self.assertEqual(mod.DEFAULT_CONTEXT_TOKENS, 262144,
+                         "precondition: import-time context is the "
+                         "architectural /api/show value -- WRONG for the "
+                         "recovered model's actual loaded num_ctx")
+        # Primary recovers between import and call: /api/ps returns
+        # phony-model:test @ context_length=8192. The recovered model's
+        # runtime context (8192) MUST reach the wire on BOTH calls, not
+        # the stale architectural 262144.
+        sent: list = []
+        mod.urllib.request.urlopen = _routed_urlopen(
+            self._canned(self.NONCOINCIDENT_MODEL), record=sent)
+        mod.call_ollama("go", schema=SCHEMA)
+        chat1 = [b for b in sent if "messages" in b][-1]
+        self.assertEqual(chat1["options"]["num_ctx"], 8192,
+                         "call 1 must ship the recovered model's num_ctx, "
+                         "not the import-time architectural value")
+        # Call 2 -- _DEFAULT_MODEL_SOURCE is no longer 'hint' so the F5
+        # branch is skipped; the num_ctx shortcut at :818 fires
+        # (`_effective_model == DEFAULT_MODEL and _call_host is
+        # _ACTIVE_HOST` both True by construction). Without the
+        # DEFAULT_CONTEXT_TOKENS refresh, this ships the stale 262144.
+        sent.clear()
+        mod.urllib.request.urlopen = _routed_urlopen(
+            self._canned(self.NONCOINCIDENT_MODEL), record=sent)
+        mod.call_ollama("go", schema=SCHEMA)
+        chat2 = [b for b in sent if "messages" in b][-1]
+        self.assertEqual(chat2["options"]["num_ctx"], 8192,
+                         "call 2 must ALSO ship the recovered num_ctx -- "
+                         "proves DEFAULT_CONTEXT_TOKENS was refreshed on "
+                         "F5 recovery; the c0961a3 shortcut at :818 would "
+                         "otherwise ship the stale import-time value")
+        self.assertNotEqual(chat2["options"]["num_ctx"], 262144,
+                            "call 2 must NOT ship the stale architectural "
+                            "value from the hint-era /api/show")
+
     def test_env_override_wins_over_config_pin(self):
         """``OLLAMA_OFFLOAD_MODEL`` per README:136 must override the pin.
 

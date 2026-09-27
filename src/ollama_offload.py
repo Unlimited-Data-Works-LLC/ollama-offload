@@ -800,8 +800,23 @@ def _call_ollama_once(
         # global DEFAULT_MODEL too, or the NEXT call falls through to the
         # else-branch below (`_effective_model = DEFAULT_MODEL`) and ships
         # the stale hint — the sticky-hint regression 70e0f3c left in.
-        global DEFAULT_MODEL
+        # DA-round3 (A): also refresh DEFAULT_CONTEXT_TOKENS. Post-c0961a3
+        # the num_ctx shortcut at :818 (`_effective_model == DEFAULT_MODEL
+        # and _call_host is _ACTIVE_HOST`) fires by CONSTRUCTION on every
+        # subsequent same-host call — we just rewrote DEFAULT_MODEL to
+        # equal _effective_model above. Without refreshing the context too,
+        # the shortcut ships the import-time hint's num_ctx (from an
+        # /api/show that may have answered against a model that isn't even
+        # loaded on the recovered host) on every wire body. Same host, just
+        # probed for /api/ps a moment ago — safe to probe again; the
+        # function fails-open to `_CFG["context_tokens_fallback"]` on any
+        # throw. No recursion: `_discover_context_tokens` never re-enters
+        # `_call_ollama_once` or `_discover_model`.
+        global DEFAULT_MODEL, DEFAULT_CONTEXT_TOKENS
         DEFAULT_MODEL = _effective_model
+        DEFAULT_CONTEXT_TOKENS = _discover_context_tokens(
+            _effective_model, base_url=_call_base
+        )
     else:
         _effective_model = DEFAULT_MODEL
     # Parity: this twin never sent num_ctx; the psm1 twin always did. Resolved
