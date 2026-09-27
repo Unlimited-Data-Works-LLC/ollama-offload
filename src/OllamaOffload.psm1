@@ -760,6 +760,20 @@ function _InvokeOllamaCallOnce {
             # — the sticky-hint regression 70e0f3c left in. Python parity:
             # `global DEFAULT_MODEL; DEFAULT_MODEL = _effective_model`.
             $Script:Discovered.Model = $effectiveModel
+            # 872de70 (A) mirror: also refresh ContextTokens. Because
+            # `_Discover` returns `$Script:Discovered` by REFERENCE, the
+            # local `$d.Model` above just flipped to `$effectiveModel` and
+            # the F4 identity guard at :768 (`$effectiveModel -eq $d.Model`)
+            # is now TRUE by construction from call 2 onward — the guard
+            # ships the cached `$d.ContextTokens` on every subsequent call
+            # against this host. Without refreshing it, the import-time
+            # hint-era num_ctx (possibly 8192 fallback or an /api/show
+            # architectural value for a model that isn't even loaded on the
+            # recovered host) travels forever. Same host we just retried
+            # against — safe to probe again; `_DiscoverContextTokensForHost`
+            # fails-open to `$cfg.context_tokens_fallback` on any throw and
+            # never re-enters `_InvokeOllamaCallOnce` or `_DiscoverModelForHost`.
+            $Script:Discovered.ContextTokens = _DiscoverContextTokensForHost -Model $effectiveModel -BaseUrl $callBase
         } else {
             $effectiveModel = $d.Model
         }

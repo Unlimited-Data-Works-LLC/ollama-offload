@@ -218,6 +218,67 @@ Describe 'OllamaOffload' {
         }
     }
 
+    Context 'F5 retry-success refreshes cached ContextTokens (872de70 A)' {
+
+        It 'refreshes $Script:Discovered.ContextTokens when the F5 retry rewrites .Model' {
+            # 872de70 mirror. On F5 retry-success in _InvokeOllamaCallOnce
+            # (source == 'hint' after import, then _DiscoverModelForHost
+            # succeeds against the resolved base_url), the block
+            # rewrites $Script:Discovered.Model to the recovered model.
+            # Because _Discover returns $Script:Discovered BY REFERENCE,
+            # the F4 identity guard at :768 (`$effectiveModel -eq $d.Model`)
+            # is TRUE by construction from call 2 onward -- so without a
+            # sibling refresh of ContextTokens, the cached import-time
+            # hint-era value ships forever. The test asserts that the
+            # cache entry actually flipped to the /api/ps runtime value
+            # (8192 from the Ps fixture) after the retry, not the
+            # 262144 architectural value that /api/show would have
+            # returned against the hint at import time.
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') {
+                    [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
+                    return (New-ChatResponse -Content '{"ok":true}')
+                }
+                throw "no fixture for $Uri"
+            }
+            $script:Sent = [System.Collections.ArrayList]::new()
+            InModuleScope OllamaOffload {
+                # Prime the module cache with the hint-era shape: Model
+                # is the hardcoded hint, ContextTokens is the /api/show
+                # architectural value (262144), source stamped 'hint' so
+                # the F5 branch fires on the next call.
+                $Script:Discovered = @{
+                    Model = $Script:DefaultModelHint
+                    ContextTokens = 262144
+                    KeepAlive = '5m'
+                    BaseUrl = 'http://test.invalid:11434'
+                }
+                $Script:DefaultModelSource = 'hint'
+            }
+            $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+            # Call 1: F5 retry fires (source == 'hint'); _DiscoverModelForHost
+            # resolves 'qwen3:8b' from /api/ps and stamps source='ps'.
+            # The 872de70 mirror block ALSO refreshes .ContextTokens via
+            # _DiscoverContextTokensForHost -> /api/ps runtime value 8192.
+            $cached = InModuleScope OllamaOffload { $Script:Discovered }
+            $cached.Model | Should -Be 'qwen3:8b' -Because 'F5 retry rewrote the cache Model'
+            $cached.ContextTokens | Should -Be 8192 -Because 'the 872de70 sibling refresh must flip ContextTokens to the recovered runtime value, not leave the stale 262144'
+            # Wire body on THIS call must already ship the fresh value.
+            $script:Sent[-1].options.num_ctx | Should -Be 8192
+            # Call 2: F5 branch skipped (source == 'ps' now); falls to the
+            # else-branch that reads $d.Model, then the F4 guard at :768
+            # sees $effectiveModel -eq $d.Model and reuses $d.ContextTokens
+            # -- which the refresh above just corrected.
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+            $script:Sent[-1].options.num_ctx | Should -Be 8192 -Because 'without the sibling refresh, call 2 would ship the stale 262144 via the F4 shortcut'
+            $script:Sent[-1].options.num_ctx | Should -Not -Be 262144
+        }
+    }
+
     Context 'environment namespace' {
 
         It 'never reads Ollama own variables' {
