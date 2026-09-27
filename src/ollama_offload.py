@@ -871,13 +871,25 @@ def _call_ollama_once(
         #       or A's None-skip preserves B's self-consistent pair.
         #       Trade-off: lock held ~10s during strict probe. F5 is a
         #       rare, slow recovery path; the extended hold is intended.
+        # DA-round6 (residual): even with the probe INSIDE the lock,
+        # a stubborn transient (persistent /api/show 500, model-reload
+        # window) can still return None to a writer that holds the
+        # lock. The prior shape wrote DEFAULT_MODEL unconditionally
+        # and skipped DEFAULT_CONTEXT_TOKENS on None — producing a
+        # cross-model pair (MODEL=A, CTX=prior-writer-B's-value). Fix:
+        # atomic all-or-nothing. On strict-None, SKIP BOTH writes and
+        # preserve whatever coherent pair the module already held
+        # (import-time hint pair, or a prior successful writer's pair).
+        # A forfeited advance is cheaper than a corrupted global; the
+        # next call re-attempts recovery cleanly. F5 is a rare, slow
+        # path — the trade-off is intentional.
         global DEFAULT_MODEL, DEFAULT_CONTEXT_TOKENS
         with _F5_REFRESH_LOCK:
             _new_ctx = _probe_context_tokens_strict(
                 _effective_model, base_url=_call_base
             )
-            DEFAULT_MODEL = _effective_model
             if _new_ctx is not None:
+                DEFAULT_MODEL = _effective_model
                 DEFAULT_CONTEXT_TOKENS = _new_ctx
     else:
         _effective_model = DEFAULT_MODEL

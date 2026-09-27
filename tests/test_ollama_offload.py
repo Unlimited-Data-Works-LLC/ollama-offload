@@ -633,10 +633,19 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
             "/api/chat": _chat_response(json.dumps({"ok": True})),
         }
         mod.urllib.request.urlopen = _routed_urlopen(recovery, record=sent)
+        pre_model = mod.DEFAULT_MODEL
         mod.call_ollama("go", schema=SCHEMA)
-        self.assertEqual(mod.DEFAULT_MODEL, self.NONCOINCIDENT_MODEL,
-                         "F5 must have refreshed DEFAULT_MODEL to the "
-                         "recovered value")
+        # DA-round6 (residual): under all-or-nothing atomicity, a
+        # strict-None from the probe skips BOTH writes — model AND
+        # context — preserving whatever coherent pair the module
+        # already held. Prior shape wrote MODEL and skipped CTX,
+        # producing a cross-model pair with any prior writer's CTX
+        # (DA-r6 finding 4). Property: on strict-None, no advance.
+        self.assertEqual(mod.DEFAULT_MODEL, pre_model,
+                         "on strict-None from the context probe the "
+                         "F5 refresh must SKIP BOTH writes — MODEL "
+                         "advancing while CTX stays is precisely the "
+                         "DA-round6 cross-model pair bug")
         self.assertEqual(mod.DEFAULT_CONTEXT_TOKENS, 262144,
                          "DEFAULT_CONTEXT_TOKENS must retain the import-time "
                          "value (262144) — a fail-open probe returning the "
@@ -878,6 +887,144 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
                 f"{entry['thread']!r}): probe-outside-lock reopens "
                 f"the DA-round5 cross-model composition race. "
                 f"entries={entries!r}")
+
+    def test_f5_writer_pair_coherence_under_stubborn_none(self):
+        """DA-round6 (residual): probe-inside-lock is necessary but not
+        sufficient. Under the r5 shape (writes MODEL unconditionally,
+        skips only CTX on strict-None), a stubborn transient inside the
+        lock still corrupts the pair:
+
+          - Writer B enters lock, probe returns V, writes
+            (DEFAULT_MODEL=B, DEFAULT_CONTEXT_TOKENS=V), releases.
+          - Writer A enters lock, probe STILL returns None (persistent
+            /api/show 500, model reload in progress), writes
+            DEFAULT_MODEL=A, SKIPS ctx write.
+          - Final pair: (DEFAULT_MODEL=A, DEFAULT_CONTEXT_TOKENS=V-for-B)
+            — cross-model, r5's property violated inside the lock.
+
+        Fix: atomic all-or-nothing. On strict-None, skip BOTH writes so
+        the pair either advances coherently to (B, V) or stays at the
+        pre-state. Never a half-applied pair.
+
+        Design: force B-first ordering so the bug shape is deterministic
+        (A-first coincidentally produces a coherent pair under either
+        code path). B's `_discover_model` returns MODEL_B, its probe
+        returns V and signals an event. A's `_discover_model` waits on
+        that event before returning MODEL_A, so A blocks on the F5 lock
+        until B has committed. Then A's probe returns None, exercising
+        the residual defect.
+        """
+        MODEL_B = "MODEL_B:test"
+        MODEL_A = "MODEL_A:test"
+        V = 98304
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down at import"),
+            "/api/tags": urllib.error.URLError("primary down at import"),
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "hint",
+                         "precondition: import must have hit hint")
+        HINT_MODEL = mod.DEFAULT_MODEL
+        HINT_CTX = mod.DEFAULT_CONTEXT_TOKENS
+        self.assertNotEqual(HINT_MODEL, MODEL_B,
+                            "test setup: hint model must differ from B")
+        self.assertNotEqual(HINT_MODEL, MODEL_A,
+                            "test setup: hint model must differ from A")
+
+        # Feed /api/chat something callable; the F5 refresh short-circuits
+        # before /api/chat under our mocks, but call_ollama still resolves
+        # the effective host.
+        mod.urllib.request.urlopen = _routed_urlopen({
+            "/api/version": VERSION,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        })
+
+        b_reached_discover = threading.Event()
+        b_in_probe = threading.Event()
+
+        def instrumented_discover(*, base_url=None):
+            # Guarantee both threads pass the source=='hint' gate at
+            # :812 before either flips source: use B's arrival as the
+            # rendezvous — A's discover blocks until B is INSIDE its
+            # probe (i.e. B holds the F5 lock and is already past the
+            # source-flip). Then A flips (idempotent) and proceeds; A
+            # will block on the F5 lock until B commits and releases.
+            tname = threading.current_thread().name
+            if "B" in tname:
+                mod._DEFAULT_MODEL_SOURCE = "ps"
+                b_reached_discover.set()
+                return MODEL_B
+            # A path
+            self.assertTrue(b_reached_discover.wait(timeout=5.0),
+                            "B never reached _discover_model")
+            self.assertTrue(b_in_probe.wait(timeout=5.0),
+                            "B never entered its probe")
+            mod._DEFAULT_MODEL_SOURCE = "ps"
+            return MODEL_A
+
+        def instrumented_probe(model, *, base_url=None):
+            # MODEL_B → return V (probe success). MODEL_A → return None
+            # (stubborn transient inside the lock). Both branches run
+            # while _F5_REFRESH_LOCK is held by their respective caller.
+            if model == MODEL_B:
+                b_in_probe.set()
+                return V
+            return None
+
+        mod._discover_model = instrumented_discover
+        mod._probe_context_tokens_strict = instrumented_probe
+
+        errors = []
+
+        def worker():
+            try:
+                mod.call_ollama("go", schema=SCHEMA)
+            except Exception as exc:  # pragma: no cover - defensive
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, name="writer-B"),
+            threading.Thread(target=worker, name="writer-A"),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15.0)
+        for t in threads:
+            self.assertFalse(t.is_alive(),
+                             f"worker {t.name} deadlocked or hung")
+        self.assertEqual(errors, [],
+                         f"workers raised: {errors!r}")
+
+        final_model = mod.DEFAULT_MODEL
+        final_ctx = mod.DEFAULT_CONTEXT_TOKENS
+        # Coherent pair property: EITHER both belong to writer B
+        # (probe-success advanced the pair) OR both remain at the
+        # pre-test hint state (probe-None left the pair alone). The
+        # buggy shape produces (MODEL_A, V) — MODEL_A never has an
+        # associated CTX in this test, and V belongs to MODEL_B.
+        b_pair = (final_model == MODEL_B and final_ctx == V)
+        pre_pair = (final_model == HINT_MODEL and final_ctx == HINT_CTX)
+        self.assertTrue(
+            b_pair or pre_pair,
+            f"DA-round6 residual race: pair is not coherent — "
+            f"(DEFAULT_MODEL={final_model!r}, "
+            f"DEFAULT_CONTEXT_TOKENS={final_ctx!r}). "
+            f"Expected either ({MODEL_B!r}, {V!r}) or "
+            f"({HINT_MODEL!r}, {HINT_CTX!r}). Cross-model pair "
+            f"({MODEL_A!r}, {V!r}) is the exact bug shape: writer "
+            f"A wrote MODEL under strict-None while writer B's "
+            f"CTX stayed. Fix: skip BOTH writes on strict-None.")
 
     def test_probe_ollama_reports_reachability_separately_when_source_is_hint(self):
         """DA-round4 (E): `probe_ollama()` compared `DEFAULT_MODEL in models`
