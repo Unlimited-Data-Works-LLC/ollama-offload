@@ -837,17 +837,31 @@ function _InvokeOllamaCallOnce {
             #       pair. Trade-off: lock held ~10s during strict probe.
             #       F5 is a rare, slow recovery path; the extended hold is
             #       intended.
+            # DA-round6 (residual) mirror of f605783: even with the probe
+            # INSIDE the lock, a stubborn transient (persistent /api/show
+            # 500, model-reload window) can still return $null to a writer
+            # that holds the lock. The prior shape wrote .Model
+            # unconditionally and skipped .ContextTokens on $null —
+            # producing a cross-model pair (Model=A, CTX=prior-writer-B's-
+            # value). Fix: atomic all-or-nothing. On strict-$null, SKIP
+            # BOTH writes and preserve whatever coherent pair
+            # $Script:Discovered already held (import-time hint pair, or a
+            # prior successful writer's pair). A forfeited advance is
+            # cheaper than a corrupted global; the next call re-attempts
+            # recovery cleanly. F5 is a rare, slow path — the trade-off
+            # is intentional.
             # Python parity: `with _F5_REFRESH_LOCK: _new_ctx =
-            # _probe_context_tokens_strict(...); DEFAULT_MODEL =
-            # _effective_model; if _new_ctx is not None:
+            # _probe_context_tokens_strict(...); if _new_ctx is not None:
+            # DEFAULT_MODEL = _effective_model;
             # DEFAULT_CONTEXT_TOKENS = _new_ctx`.
             $Script:F5RefreshLock.Wait()
             try {
                 $newCtx = _ProbeContextTokensForHostStrict -Model $effectiveModel -BaseUrl $callBase
-                $Script:Discovered.Model = $effectiveModel
                 if ($null -ne $newCtx) {
+                    $Script:Discovered.Model = $effectiveModel
                     $Script:Discovered.ContextTokens = [int]$newCtx
                 }
+                # else: skip BOTH writes — atomic all-or-nothing; next call re-attempts
             } finally {
                 [void]$Script:F5RefreshLock.Release()
             }

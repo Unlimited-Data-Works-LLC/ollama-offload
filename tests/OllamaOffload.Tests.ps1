@@ -432,6 +432,75 @@ Describe 'OllamaOffload' {
         }
     }
 
+    Context 'F5 writer pair coherence under stubborn strict-None (f605783 DA-r6)' {
+
+        It 'skips BOTH .Model AND .ContextTokens writes when strict probe returns $null' {
+            # DA-round6 (residual) mirror of f605783. Even with the probe
+            # INSIDE the lock (1fbf67c / DA-r5), a stubborn transient
+            # (persistent /api/show 500, model-reload window) can still
+            # return $null to a writer holding the lock. The prior shape
+            # wrote .Model unconditionally and skipped .ContextTokens on
+            # $null, so a serialized (B, then A) run of two writers ends
+            # with (.Model=A, .ContextTokens=V-belonging-to-B) — a cross-
+            # model pair the r5 lock was supposed to prevent.
+            #
+            # Fix: atomic all-or-nothing. On strict-$null, SKIP BOTH
+            # writes and preserve whatever coherent pair
+            # $Script:Discovered already held. A forfeited advance is
+            # cheaper than a corrupted global; the next call re-attempts.
+            #
+            # PowerShell threading semantics: Start-Job forks a fresh
+            # runspace with a NEW copy of module state, so a second job
+            # cannot observe THIS runspace's $Script:Discovered at all —
+            # a faithful two-writer concurrency test is not expressible
+            # in-process (documented on the r5 test at :387). Fall back
+            # to a deterministic single-thread mock: pre-set
+            # $Script:Discovered to a coherent hint pair, force the F5
+            # branch, mock the strict probe to return $null, then assert
+            # BOTH fields are unchanged after Invoke-OllamaCall returns.
+            # That locks the skip-BOTH behavior against a regression to
+            # "advance .Model, skip only .ContextTokens".
+            $HINT_CTX = 262144
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') { return (New-ChatResponse -Content '{"ok":true}') }
+                throw "no fixture for $Uri"
+            }
+            # _ProbeContextTokensForHostStrict: the stubborn transient —
+            # always $null. _DiscoverModelForHost runs naturally against
+            # the mocked /api/ps (returns 'qwen3:8b', flips source to
+            # 'ps'), so .Model would ADVANCE from the seeded hint value
+            # to 'qwen3:8b' under the buggy shape while .ContextTokens
+            # stays at $HINT_CTX (a cross-model pair). Under the fix,
+            # BOTH writes are skipped and both fields remain at the
+            # pre-F5 hint values.
+            Mock -ModuleName OllamaOffload _ProbeContextTokensForHostStrict {
+                param($Model, $BaseUrl)
+                return $null
+            }
+            InModuleScope OllamaOffload {
+                $Script:Discovered = @{
+                    Model = $Script:DefaultModelHint
+                    ContextTokens = 262144
+                    KeepAlive = '5m'
+                    BaseUrl = 'http://test.invalid:11434'
+                }
+                $Script:DefaultModelSource = 'hint'
+            }
+            $HINT_MODEL = InModuleScope OllamaOffload { $Script:DefaultModelHint }
+            $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+
+            $final = InModuleScope OllamaOffload { $Script:Discovered }
+            $final.Model | Should -Be $HINT_MODEL `
+                -Because 'on strict-$null the F5 refresh must SKIP the .Model write — advancing .Model to the naturally-discovered value (qwen3:8b) while .ContextTokens stays at the hint-era 262144 is precisely the DA-round6 cross-model pair bug'
+            $final.ContextTokens | Should -Be $HINT_CTX `
+                -Because 'on strict-$null the F5 refresh must SKIP the .ContextTokens write too — atomic all-or-nothing, either both writes commit or neither does'
+        }
+    }
+
     Context 'environment namespace' {
 
         It 'never reads Ollama own variables' {
