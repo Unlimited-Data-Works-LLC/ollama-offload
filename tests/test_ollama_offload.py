@@ -349,6 +349,84 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
                       "operator can act on it, not surface as a generic call "
                       "failure")
 
+    def test_env_value_stripped_before_wire(self):
+        """DA-round2 (iv): whitespace-bearing OLLAMA_OFFLOAD_MODEL must be
+        stripped, or Ollama 404s on `"  env-wins  "`."""
+        os.environ["OLLAMA_OFFLOAD_MODEL"] = "  env-wins  "
+        mod, sent = self._reload_with_config_and_routes(
+            {"url": "http://test.invalid:11434/api/chat", "model": "config-pin"},
+            ps_model=self.NONCOINCIDENT_MODEL,
+        )
+        mod.call_ollama("go", schema=SCHEMA)
+        chat_bodies = [b for b in sent if "messages" in b]
+        self.assertEqual(chat_bodies[-1]["model"], "env-wins",
+                         "OLLAMA_OFFLOAD_MODEL must be stripped on read before "
+                         "shipping on the wire")
+
+    def test_empty_string_env_is_unset_not_win(self):
+        """DA-round2 (MISSED): OLLAMA_OFFLOAD_MODEL='' must fall through to
+        the config pin. A future refactor from `if override:` to
+        `if override is not None:` would silently invert this — the test
+        locks the intended behaviour."""
+        os.environ["OLLAMA_OFFLOAD_MODEL"] = ""
+        mod, sent = self._reload_with_config_and_routes(
+            {"url": "http://test.invalid:11434/api/chat", "model": "config-pin"},
+            ps_model=self.NONCOINCIDENT_MODEL,
+        )
+        mod.call_ollama("go", schema=SCHEMA)
+        chat_bodies = [b for b in sent if "messages" in b]
+        self.assertEqual(chat_bodies[-1]["model"], "config-pin",
+                         "empty-string env is UNSET; the config pin must win")
+
+    def test_default_model_refreshed_after_import_hint_fallback(self):
+        """DA-round2 (ii CRITICAL): sticky-hint regression. Import with
+        primary DOWN → hint fires. Primary recovers → call 1's F5 retry
+        finds the real model → wire body carries it. Call 2 must ALSO
+        carry the recovered model, not the hint via the else-branch —
+        proving DEFAULT_MODEL was refreshed on F5 success."""
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down at import"),
+            "/api/tags": urllib.error.URLError("primary down at import"),
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "hint",
+                         "precondition: import-time discovery must have hit "
+                         "the hint fallback")
+        self.assertEqual(mod.DEFAULT_MODEL, mod._DEFAULT_MODEL_HINT,
+                         "precondition: module DEFAULT_MODEL holds the hint")
+        # Primary recovers between import and call: swap routes to healthy.
+        sent: list = []
+        mod.urllib.request.urlopen = _routed_urlopen(
+            self._canned(self.NONCOINCIDENT_MODEL), record=sent)
+        # Call 1 — F5 retry probes, finds phony-model:test, ships it.
+        mod.call_ollama("go", schema=SCHEMA)
+        chat1 = [b for b in sent if "messages" in b][-1]
+        self.assertEqual(chat1["model"], self.NONCOINCIDENT_MODEL,
+                         "call 1 must ship the recovered model, not the hint")
+        # Call 2 — _DEFAULT_MODEL_SOURCE is no longer 'hint' so the F5 branch
+        # is skipped; execution falls to `_effective_model = DEFAULT_MODEL`.
+        # Without the DEFAULT_MODEL refresh, this ships the stale hint.
+        sent.clear()
+        mod.urllib.request.urlopen = _routed_urlopen(
+            self._canned(self.NONCOINCIDENT_MODEL), record=sent)
+        mod.call_ollama("go", schema=SCHEMA)
+        chat2 = [b for b in sent if "messages" in b][-1]
+        self.assertEqual(chat2["model"], self.NONCOINCIDENT_MODEL,
+                         "call 2 must ALSO ship the recovered model — proves "
+                         "DEFAULT_MODEL was refreshed on F5 retry success")
+        self.assertNotEqual(chat2["model"], mod._DEFAULT_MODEL_HINT,
+                            "call 2 must NOT ship the sticky hint")
+
     def test_env_override_wins_over_config_pin(self):
         """``OLLAMA_OFFLOAD_MODEL`` per README:136 must override the pin.
 

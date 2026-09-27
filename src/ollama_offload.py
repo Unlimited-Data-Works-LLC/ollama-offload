@@ -375,7 +375,10 @@ def _discover_model(*, base_url: str | None = None) -> str:
     preserves import-time behaviour of probing the module-active host.
     """
     global _DEFAULT_MODEL_SOURCE
-    override = os.environ.get("OLLAMA_OFFLOAD_MODEL")
+    # Strip on read so a whitespace-bearing env value ("  qwen3:8b  ") does not
+    # ship to Ollama and 404. Empty-after-strip = unset (falsy check below still
+    # falls through). DA-round2 (iv): unstripped env value bug 2026-09-26.
+    override = os.environ.get("OLLAMA_OFFLOAD_MODEL", "").strip()
     if override:
         _DEFAULT_MODEL_SOURCE = "env"
         return override
@@ -744,7 +747,8 @@ def _call_ollama_once(
     # Pre-3987814 this collapsed to a single truthy check on the pin, which
     # made env-override dead whenever config pinned a model — the exact
     # violation of README:136 the fix commit claimed to close.
-    _env_model_override = os.environ.get("OLLAMA_OFFLOAD_MODEL")
+    # DA-round2 (iv): strip on read here too. Same reasoning as :378.
+    _env_model_override = os.environ.get("OLLAMA_OFFLOAD_MODEL", "").strip()
     if model is not None:
         _effective_model = model
     elif _env_model_override:
@@ -757,6 +761,20 @@ def _call_ollama_once(
         # would send the ACTIVE host's discovered model to the secondary,
         # exactly the failure the 3987814 follow-up (3) named.
         _effective_model = _discover_model(base_url=_call_base)
+        # DA-round2 (ii): F3 hint-guard. cfdcff9 restored this branch but
+        # left it fail-open: _discover_model returns _DEFAULT_MODEL_HINT if
+        # both /api/ps and /api/tags throw on the secondary too. The F5
+        # elif below never fires (F3 already matched), so the hint would
+        # ship. Mirror the F5 guard: if source is "hint" after this probe,
+        # the reachable secondary could not answer — treat as unavailable
+        # so the failover orchestrator (fix iv) walks to the next host.
+        if _DEFAULT_MODEL_SOURCE == "hint":
+            raise OllamaUnavailable(
+                f"model discovery fell back to _DEFAULT_MODEL_HINT for host="
+                f"{_call_host['name']} at {_call_base}. Set OLLAMA_OFFLOAD_MODEL, "
+                f"add `model` to the host entry, or ensure /api/ps + /api/tags "
+                f"answer with an installed model before calling."
+            )
     elif _DEFAULT_MODEL_SOURCE == "hint":
         # F5: import-time discovery fell back to the hardcoded hint (primary
         # host was DOWN at import). Do NOT ship that hint to a REACHABLE host
@@ -769,12 +787,21 @@ def _call_ollama_once(
         # probably-wrong name.
         _effective_model = _discover_model(base_url=_call_base)
         if _DEFAULT_MODEL_SOURCE == "hint":
-            raise OllamaCallError(
+            # DA-round2 (iii): was OllamaCallError, which the failover
+            # orchestrator at :1220 does NOT catch (only OllamaUnavailable).
+            # A hint-fallback on primary must let failover_hosts be walked.
+            raise OllamaUnavailable(
                 f"model discovery fell back to _DEFAULT_MODEL_HINT for host="
                 f"{_call_host['name']} at {_call_base}. Set OLLAMA_OFFLOAD_MODEL, "
                 f"add `model` to the host entry, or ensure /api/ps + /api/tags "
                 f"answer with an installed model before calling."
             )
+        # DA-round2 (ii CRITICAL): retry succeeded. Refresh the module
+        # global DEFAULT_MODEL too, or the NEXT call falls through to the
+        # else-branch below (`_effective_model = DEFAULT_MODEL`) and ships
+        # the stale hint — the sticky-hint regression 70e0f3c left in.
+        global DEFAULT_MODEL
+        DEFAULT_MODEL = _effective_model
     else:
         _effective_model = DEFAULT_MODEL
     # Parity: this twin never sent num_ctx; the psm1 twin always did. Resolved
