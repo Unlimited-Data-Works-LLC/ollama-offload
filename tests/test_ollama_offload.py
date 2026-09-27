@@ -428,23 +428,46 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
                             "call 2 must NOT ship the sticky hint")
 
     def test_whitespace_only_env_falls_through_to_config_pin(self):
-        """DA-round3 (B): whitespace-only OLLAMA_OFFLOAD_MODEL ('   ') must
-        fall through to the config pin, not ship as the wire model. The
+        """DA-round3 (B) + DA-round4 (C): whitespace-only OLLAMA_OFFLOAD_MODEL
+        must fall through to the config pin, not ship as the wire model. The
         `.strip()` at :751 (and :378) collapses it to '' -> falsy -> pin
         wins. Empty-string is already locked by
         `test_empty_string_env_is_unset_not_win`; whitespace-only is a
         distinct input class that a refactor removing either `.strip()`
-        call would silently ship as-is -> 404 on the wire."""
-        os.environ["OLLAMA_OFFLOAD_MODEL"] = "   "
-        mod, sent = self._reload_with_config_and_routes(
-            {"url": "http://test.invalid:11434/api/chat", "model": "config-pin"},
-            ps_model=self.NONCOINCIDENT_MODEL,
-        )
-        mod.call_ollama("go", schema=SCHEMA)
-        chat_bodies = [b for b in sent if "messages" in b]
-        self.assertEqual(chat_bodies[-1]["model"], "config-pin",
-                         "whitespace-only env is UNSET after strip; the "
-                         "config pin must win")
+        call would silently ship as-is -> 404 on the wire.
+
+        DA-round4 (C) parametrized this beyond the original ``'   '`` case:
+        the whitespace category is not one input but a family (tab,
+        newline, NBSP, mixed), and a `.strip()` call that drops any of them
+        from its default set (Python's `str.strip()` covers ASCII whitespace
+        AND NBSP `\\u00a0` because it treats characters `.isspace()` == True)
+        must ALSO drop the rest. A refactor to a hand-rolled strip on
+        `" \\t\\n"` alone would leak NBSP; parametrization catches that.
+        """
+        for label, value in (
+            ("spaces", "   "),
+            ("tab", "\t"),
+            ("newline", "\n"),
+            ("nbsp", " "),
+            ("mixed", " \t \n "),
+        ):
+            with self.subTest(whitespace=label):
+                # Fresh env + module reload per sub-case so the module-scope
+                # `_DEFAULT_MODEL_SOURCE` state doesn't leak between cases.
+                os.environ["OLLAMA_OFFLOAD_MODEL"] = value
+                mod, sent = self._reload_with_config_and_routes(
+                    {"url": "http://test.invalid:11434/api/chat",
+                     "model": "config-pin"},
+                    ps_model=self.NONCOINCIDENT_MODEL,
+                )
+                mod.call_ollama("go", schema=SCHEMA)
+                chat_bodies = [b for b in sent if "messages" in b]
+                self.assertEqual(
+                    chat_bodies[-1]["model"], "config-pin",
+                    f"whitespace-only env ({label!r}) is UNSET after "
+                    f"strip; the config pin must win — the wire body "
+                    f"must NOT ship {value!r}")
+                os.environ.pop("OLLAMA_OFFLOAD_MODEL", None)
 
     def test_discover_model_strips_env_override_directly(self):
         """DA-round3 (C): the `.strip()` at :378 in `_discover_model` is
@@ -553,6 +576,188 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
                          "README:136 — the shipped config pins, so this is the "
                          "only path the documented override actually reaches")
         self.assertEqual(result["_meta"]["model"], "env-wins")
+
+    def test_fail_open_probe_does_not_clobber_import_time_default_context(self):
+        """DA-round4 (A): the F5 refresh must NOT clobber a
+        possibly-more-accurate import-time DEFAULT_CONTEXT_TOKENS with the
+        fallback CONSTANT when the recovery probe transiently fails. Setup:
+        primary DOWN at import EXCEPT /api/show answers (so import-time
+        DEFAULT_CONTEXT_TOKENS = 262144 from SHOW's model_info). Recovery:
+        /api/tags succeeds (so `_discover_model` finds the real model), but
+        /api/ps has NO models AND /api/show throws — `_discover_context_tokens`
+        would return the fallback 8192. Assert DEFAULT_CONTEXT_TOKENS RETAINS
+        262144; a plain `DEFAULT_CONTEXT_TOKENS = _discover_context_tokens(...)`
+        writes 8192 and this assertion fails.
+        """
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        # Import-time: /api/ps + /api/tags fail (hint fires for the model),
+        # /api/show still answers (context = 262144 from model_info).
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down at import"),
+            "/api/tags": urllib.error.URLError("primary down at import"),
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "hint",
+                         "precondition: import hit the hint fallback")
+        self.assertEqual(mod.DEFAULT_CONTEXT_TOKENS, 262144,
+                         "precondition: import-time context is the "
+                         "architectural /api/show value")
+        # Recovery: /api/tags names the real model so _discover_model
+        # succeeds; /api/ps returns EMPTY (model not loaded yet) and
+        # /api/show throws — the strict context probe must return None
+        # so the F5 write is skipped.
+        sent: list = []
+        recovery = {
+            "/api/version": VERSION,
+            "/api/ps": {"models": []},
+            "/api/tags": {"models": [{"name": self.NONCOINCIDENT_MODEL}]},
+            "/api/show": urllib.error.HTTPError(
+                "http://x", 500, "Internal Server Error", {}, None),
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        mod.urllib.request.urlopen = _routed_urlopen(recovery, record=sent)
+        mod.call_ollama("go", schema=SCHEMA)
+        self.assertEqual(mod.DEFAULT_MODEL, self.NONCOINCIDENT_MODEL,
+                         "F5 must have refreshed DEFAULT_MODEL to the "
+                         "recovered value")
+        self.assertEqual(mod.DEFAULT_CONTEXT_TOKENS, 262144,
+                         "DEFAULT_CONTEXT_TOKENS must retain the import-time "
+                         "value (262144) — a fail-open probe returning the "
+                         "fallback constant 8192 would clobber a possibly "
+                         "more-accurate import-time value; the strict-None "
+                         "guard skips the write")
+        self.assertNotEqual(
+            mod.DEFAULT_CONTEXT_TOKENS,
+            int(mod._CFG.get("context_tokens_fallback", 8192)),
+            "post-refresh value must NOT be the fallback constant")
+
+    def test_context_bytes_transitions_atomically_across_f5_refresh(self):
+        """DA-round4 (D): `context_bytes(ratio)` reads DEFAULT_CONTEXT_TOKENS
+        lock-free. Under Fix B the F5 refresh commits DEFAULT_MODEL +
+        DEFAULT_CONTEXT_TOKENS together under `_F5_REFRESH_LOCK`, so
+        successive reads observe (old, old) or (new, new) — never a torn
+        (new_model, old_tokens). Snapshot `context_bytes(0.5)` at THREE
+        points: post-import (hint-era 262144), post-first-call (F5 flip
+        to the recovered 98304), post-second-call (stable at 98304 — F5
+        branch is skipped because source is no longer "hint"). Assert the
+        transition happened once and later reads are consistent.
+        """
+        # Recovery ctx MUST NOT equal `_CFG['context_tokens_fallback']`
+        # (default 8192) so the Fix-A strict-None guard would NOT skip
+        # the write — this test measures the SUCCESS path, not the
+        # fall-through path.
+        RECOVERED_CTX = 98304
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down at import"),
+            "/api/tags": urllib.error.URLError("primary down at import"),
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        # Point 1: post-import — hint-era 262144 from SHOW.
+        cb_import = mod.context_bytes(0.5)
+        self.assertEqual(cb_import, int(262144 * 0.5 * 4),
+                         "point 1: post-import context_bytes reflects the "
+                         "hint-era DEFAULT_CONTEXT_TOKENS (262144)")
+        # Swap to a healthy recovery with a DIFFERENT context.
+        recovery = {
+            "/api/version": VERSION,
+            "/api/ps": {"models": [
+                {"name": self.NONCOINCIDENT_MODEL,
+                 "context_length": RECOVERED_CTX}
+            ]},
+            "/api/tags": {"models": [{"name": self.NONCOINCIDENT_MODEL}]},
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        mod.urllib.request.urlopen = _routed_urlopen(recovery)
+        mod.call_ollama("go", schema=SCHEMA)
+        # Point 2: post-first-call — F5 flipped the pair together.
+        cb_after_flip = mod.context_bytes(0.5)
+        self.assertEqual(cb_after_flip, int(RECOVERED_CTX * 0.5 * 4),
+                         "point 2: post-first-call context_bytes reflects "
+                         "the F5-refreshed value — the flip must be "
+                         "OBSERVABLE by the same reader that saw the "
+                         "hint-era value")
+        self.assertNotEqual(cb_after_flip, cb_import,
+                            "the transition must have happened — otherwise "
+                            "the refresh path is inert")
+        # Second call: F5 branch skipped now (source != "hint"); value
+        # must remain stable.
+        mod.call_ollama("go", schema=SCHEMA)
+        # Point 3: post-second-call — no further refresh, value stable.
+        cb_stable = mod.context_bytes(0.5)
+        self.assertEqual(cb_stable, cb_after_flip,
+                         "point 3: post-second-call context_bytes must "
+                         "match point 2 — no further F5 refresh runs "
+                         "because _DEFAULT_MODEL_SOURCE is no longer "
+                         "'hint'; readers see a stable value across the "
+                         "lock boundary")
+
+    def test_probe_ollama_reports_reachability_separately_when_source_is_hint(self):
+        """DA-round4 (E): `probe_ollama()` compared `DEFAULT_MODEL in models`
+        without considering that `DEFAULT_MODEL` may be
+        `_DEFAULT_MODEL_HINT` (import fell through because the primary was
+        down at import). A reachable host that never served the hint model
+        was reported as "reachable but <hint> missing" — a false negative
+        for reachability. Fix: when `_DEFAULT_MODEL_SOURCE == 'hint'` at
+        probe time, report reachability as True and NOTE the hint-source
+        rather than compare an import-time fallback to per-host truth.
+        """
+        # Import with primary down so the hint fires.
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down at import"),
+            "/api/tags": urllib.error.URLError("primary down at import"),
+            "/api/show": SHOW,
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "hint",
+                         "precondition: import hit hint fallback")
+        # Swap to a reachable host whose /api/tags names a DIFFERENT
+        # model — the hint is NOT in that list. Old code returns
+        # (False, "reachable but <hint> missing"); new code must return
+        # (True, "...NOT compared...").
+        mod.urllib.request.urlopen = _routed_urlopen({
+            "/api/tags": {"models": [{"name": "other-model:test"}]},
+        })
+        ok, msg = mod.probe_ollama()
+        self.assertTrue(
+            ok,
+            "reachable host must report reachable=True when the module "
+            "DEFAULT_MODEL is a hint (import-time fallback), not compared "
+            "to per-host truth")
+        self.assertIn("hint", msg.lower(),
+                      "message must name the hint-source so an operator can "
+                      "act on it")
+        self.assertNotIn(
+            "missing", msg.lower(),
+            "message must NOT report the hint as 'missing' — reachability "
+            "and hint-source are distinct facts")
 
 
 class TestEnvironmentNamespace(unittest.TestCase):

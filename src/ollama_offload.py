@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -435,26 +436,16 @@ _DEFAULT_MODEL_SOURCE: str = "unknown"
 DEFAULT_MODEL = _discover_model()
 
 
-def _discover_context_tokens(model: str, *, base_url: str | None = None) -> int:
-    """Learn the model's LOADED context window DYNAMICALLY (the runtime num_ctx that
-    Ollama is actually serving), not the architectural maximum.
-
-    Ollama exposes TWO context numbers and they differ:
-    - /api/ps `context_length` per running model = the RUNTIME context (operator's
-      num_ctx choice via Modelfile / OLLAMA_CONTEXT env). This is what actually gets
-      used per request.
-    - /api/show model_info.<arch>.context_length = the ARCHITECTURAL max (native
-      pretraining ceiling). Often much larger than what's loaded (e.g. 262144 vs 98304
-      when VRAM pressure or KV-cache quantization forces a smaller load).
-
-    We MUST use the runtime value or we will over-fill prompts. Probe pattern:
-    a mismatch between architectural max and runtime is normal (operator chooses),
-    but the RUNTIME value is what serves the request.
-
-    ``base_url`` overrides the probe target for the per-call host — see
-    :func:`_discover_model` for the same pattern. Without it a runtime probe
-    for a failed-over or ``host=<name>``-overridden call would hit the
-    module-active host, sending the wrong host's context to the right host.
+def _probe_context_tokens_strict(model: str, *, base_url: str | None = None) -> int | None:
+    """DA-round4 (A): STRICT context probe. Returns the discovered runtime
+    context on success, or ``None`` when the probe would have fallen through
+    to ``_CFG['context_tokens_fallback']``. Distinguishes the fallback CONSTANT
+    from a real discovered value that happens to equal it — so the F5 refresh
+    at :~815 can skip the write instead of clobbering a possibly-more-accurate
+    import-time DEFAULT_CONTEXT_TOKENS with the fallback (an identity-match
+    check on the constant would false-positive whenever /api/ps genuinely
+    reports 8192 as the loaded num_ctx). :func:`_discover_context_tokens`
+    wraps this and applies the fallback for callers that still want an int.
     """
     override = os.environ.get("OLLAMA_OFFLOAD_CONTEXT_TOKENS")
     if override:
@@ -489,7 +480,7 @@ def _discover_context_tokens(model: str, *, base_url: str | None = None) -> int:
         with urllib.request.urlopen(req, timeout=5) as resp:
             info = json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return int(_CFG.get("context_tokens_fallback", 8192))
+        return None
 
     params = info.get("parameters", "") or ""
     if isinstance(params, str):
@@ -508,10 +499,53 @@ def _discover_context_tokens(model: str, *, base_url: str | None = None) -> int:
         if key.endswith(".context_length") and isinstance(val, int):
             return val
 
+    return None
+
+
+def _discover_context_tokens(model: str, *, base_url: str | None = None) -> int:
+    """Learn the model's LOADED context window DYNAMICALLY (the runtime num_ctx that
+    Ollama is actually serving), not the architectural maximum.
+
+    Ollama exposes TWO context numbers and they differ:
+    - /api/ps `context_length` per running model = the RUNTIME context (operator's
+      num_ctx choice via Modelfile / OLLAMA_CONTEXT env). This is what actually gets
+      used per request.
+    - /api/show model_info.<arch>.context_length = the ARCHITECTURAL max (native
+      pretraining ceiling). Often much larger than what's loaded (e.g. 262144 vs 98304
+      when VRAM pressure or KV-cache quantization forces a smaller load).
+
+    We MUST use the runtime value or we will over-fill prompts. Probe pattern:
+    a mismatch between architectural max and runtime is normal (operator chooses),
+    but the RUNTIME value is what serves the request.
+
+    ``base_url`` overrides the probe target for the per-call host — see
+    :func:`_discover_model` for the same pattern. Without it a runtime probe
+    for a failed-over or ``host=<name>``-overridden call would hit the
+    module-active host, sending the wrong host's context to the right host.
+
+    Wraps :func:`_probe_context_tokens_strict`; on a fallback path this returns
+    ``int(_CFG.get("context_tokens_fallback", 8192))``. Callers that must
+    DISTINGUISH the fallback constant from a genuine discovered value (the F5
+    refresh at :~815 does) call the strict form directly.
+    """
+    got = _probe_context_tokens_strict(model, base_url=base_url)
+    if got is not None:
+        return got
     return int(_CFG.get("context_tokens_fallback", 8192))
 
 
 DEFAULT_CONTEXT_TOKENS = _discover_context_tokens(DEFAULT_MODEL)
+
+# DA-round4 (B): serialize the F5 refresh at :~815 so a concurrent reader
+# between the DEFAULT_MODEL write and the DEFAULT_CONTEXT_TOKENS write cannot
+# see (new_model, old_tokens). The block probes the context into a LOCAL first
+# (the blocking urlopen is up to ~10s of wall time) and then commits BOTH
+# writes under this lock, so the observable transition is atomic across
+# concurrent writers. Readers (`context_bytes()`, the :~832 shortcut) stay
+# lock-free — CPython attribute reads are atomic on a single value, and the
+# homelab consumer is single-threaded in practice; the lock is defense against
+# a future async caller pattern, not a correctness dependency of the hot path.
+_F5_REFRESH_LOCK = threading.Lock()
 
 
 def get_consumer_config(section: str) -> dict:
@@ -812,11 +846,29 @@ def _call_ollama_once(
         # function fails-open to `_CFG["context_tokens_fallback"]` on any
         # throw. No recursion: `_discover_context_tokens` never re-enters
         # `_call_ollama_once` or `_discover_model`.
-        global DEFAULT_MODEL, DEFAULT_CONTEXT_TOKENS
-        DEFAULT_MODEL = _effective_model
-        DEFAULT_CONTEXT_TOKENS = _discover_context_tokens(
+        # DA-round4 (A+B): probe context into a LOCAL first, THEN commit both
+        # writes together under `_F5_REFRESH_LOCK`. Two coupled fixes:
+        #   A — `_probe_context_tokens_strict` returns None when the probe
+        #       fell through to the fallback constant (transient /api/show
+        #       500, model not in /api/ps yet). Writing that fallback back
+        #       to DEFAULT_CONTEXT_TOKENS would CLOBBER a possibly-more-
+        #       accurate import-time value (e.g. an architectural /api/show
+        #       result of 262144). Skip the write on the strict-None signal.
+        #   B — the prior shape wrote DEFAULT_MODEL, then BLOCKED up to ~10s
+        #       inside `_discover_context_tokens`, then wrote
+        #       DEFAULT_CONTEXT_TOKENS. A concurrent reader between the two
+        #       writes saw (new model, old tokens). Probe-into-local FIRST
+        #       (before taking the lock, since the network call is long),
+        #       then commit both writes under the lock so a concurrent
+        #       writer cannot interleave the pair.
+        _new_ctx = _probe_context_tokens_strict(
             _effective_model, base_url=_call_base
         )
+        global DEFAULT_MODEL, DEFAULT_CONTEXT_TOKENS
+        with _F5_REFRESH_LOCK:
+            DEFAULT_MODEL = _effective_model
+            if _new_ctx is not None:
+                DEFAULT_CONTEXT_TOKENS = _new_ctx
     else:
         _effective_model = DEFAULT_MODEL
     # Parity: this twin never sent num_ctx; the psm1 twin always did. Resolved
@@ -1331,11 +1383,31 @@ def ollama_healthcheck(*, timeout_s: int = 4) -> list[dict]:
 
 
 def probe_ollama() -> tuple[bool, str]:
-    """Quick reachability probe: returns (ok, message). URL derived from OLLAMA_OFFLOAD_URL."""
+    """Quick reachability probe: returns (ok, message). URL derived from OLLAMA_OFFLOAD_URL.
+
+    DA-round4 (E): when ``_DEFAULT_MODEL_SOURCE == "hint"`` at probe time, the
+    module ``DEFAULT_MODEL`` is the import-time hardcoded fallback (primary was
+    down at import) — NOT a fact discovered on THIS host. Comparing that hint
+    to the reachable target's model list reports a healthy host as
+    "model missing" by construction whenever the hint disagrees with what the
+    host actually serves (e.g. a fresh probe against an override host that
+    happens to be up, or a non-homelab host serving a different lineup).
+    Split reachability from model-availability in that case: the host is
+    reachable, and model presence is UNKNOWN because the hint is not a
+    per-host truth. Once F5 recovery flips the source away from ``"hint"``
+    (or if the source was never ``"hint"``), the original comparison holds.
+    """
     tags_url = OLLAMA_OFFLOAD_URL.rsplit("/api/", 1)[0] + "/api/tags"
     try:
         with urllib.request.urlopen(urllib.request.Request(tags_url), timeout=5) as resp:
             models = [m["name"] for m in json.loads(resp.read()).get("models", [])]
+        if _DEFAULT_MODEL_SOURCE == "hint":
+            return True, (
+                f"Ollama reachable at {tags_url} ({len(models)} models); "
+                f"module DEFAULT_MODEL is _DEFAULT_MODEL_HINT (import-time "
+                f"fallback, primary was down at import) — NOT compared to "
+                f"the host's model list. found: {models}"
+            )
         if DEFAULT_MODEL in models:
             return True, f"Ollama reachable at {tags_url}; {DEFAULT_MODEL} present ({len(models)} models)"
         return False, f"Ollama reachable but {DEFAULT_MODEL} missing; found: {models}"
