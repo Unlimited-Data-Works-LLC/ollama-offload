@@ -810,10 +810,9 @@ function _InvokeOllamaCallOnce {
             # architectural value for a model that isn't even loaded on the
             # recovered host) travels forever.
             #
-            # DA-round4 (A+B) mirror of 02e04db: probe context into a LOCAL
-            # first (the /api/ps + /api/show probes are up to ~10s of wall
-            # time), THEN commit both writes together under
-            # $Script:F5RefreshLock. Two coupled fixes:
+            # DA-round4 (A+B) + DA-round5 (composition) mirror of 1fbf67c:
+            # probe context AND commit both writes atomically under
+            # $Script:F5RefreshLock. Three coupled fixes:
             #   A — `_ProbeContextTokensForHostStrict` returns $null when the
             #       probe fell through to the fallback constant (transient
             #       /api/show error, model not in /api/ps yet). Writing that
@@ -823,16 +822,28 @@ function _InvokeOllamaCallOnce {
             #   B — the prior shape wrote .Model, then BLOCKED up to ~10s
             #       inside `_DiscoverContextTokensForHost`, then wrote
             #       .ContextTokens. A concurrent reader between the two
-            #       writes saw (new_model, old_tokens). Probe-into-local
-            #       FIRST (before taking the lock, since the network call
-            #       is long), then commit both writes under the lock so a
-            #       concurrent writer cannot interleave the pair.
-            # Python parity: `_new_ctx = _probe_context_tokens_strict(...);
-            # with _F5_REFRESH_LOCK: DEFAULT_MODEL = _effective_model;
-            # if _new_ctx is not None: DEFAULT_CONTEXT_TOKENS = _new_ctx`.
-            $newCtx = _ProbeContextTokensForHostStrict -Model $effectiveModel -BaseUrl $callBase
+            #       writes saw (new_model, old_tokens).
+            #   composition (DA-round5) — Fix-A's $null-skip and Fix-B's
+            #       under-lock-commit COMPOSE into a race when the probe is
+            #       taken OUTSIDE the lock. Repro: writer B probes ctx=98304
+            #       for model B, takes lock, writes (Model=B, ctx=98304).
+            #       Writer A concurrently probes strict → $null (transient
+            #       error), takes lock, writes Model=A but SKIPS the ctx
+            #       write per Fix A. Final pair: (Model=A, ctx=98304-
+            #       belongs-to-B) — a cross-model pair, exactly what the
+            #       lock was supposed to prevent. Fix: probe INSIDE the
+            #       lock so A's probe runs after B releases and sees fresh
+            #       state, or A's $null-skip preserves B's self-consistent
+            #       pair. Trade-off: lock held ~10s during strict probe.
+            #       F5 is a rare, slow recovery path; the extended hold is
+            #       intended.
+            # Python parity: `with _F5_REFRESH_LOCK: _new_ctx =
+            # _probe_context_tokens_strict(...); DEFAULT_MODEL =
+            # _effective_model; if _new_ctx is not None:
+            # DEFAULT_CONTEXT_TOKENS = _new_ctx`.
             $Script:F5RefreshLock.Wait()
             try {
+                $newCtx = _ProbeContextTokensForHostStrict -Model $effectiveModel -BaseUrl $callBase
                 $Script:Discovered.Model = $effectiveModel
                 if ($null -ne $newCtx) {
                     $Script:Discovered.ContextTokens = [int]$newCtx

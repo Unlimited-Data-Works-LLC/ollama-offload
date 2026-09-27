@@ -362,6 +362,76 @@ Describe 'OllamaOffload' {
         }
     }
 
+    Context 'F5 strict probe runs UNDER the refresh lock (1fbf67c DA-r5)' {
+
+        It 'holds $Script:F5RefreshLock while _ProbeContextTokensForHostStrict runs' {
+            # DA-round5 (composition) mirror of 1fbf67c. Fix-A (strict-$null
+            # skips the ctx write) and Fix-B (commit the pair under
+            # $Script:F5RefreshLock) COMPOSE into a cross-model race unless
+            # the strict probe runs INSIDE the lock. Repro under a probe-
+            # outside-lock shape: writer B probes ctx=V for model B strict
+            # → V, takes lock, writes (Model=B, ContextTokens=V), releases.
+            # Writer A had probed for model A concurrently, /api/show
+            # errored → strict returns $null; A takes lock, writes Model=A
+            # but SKIPS ctx per Fix A. Final pair: (Model=A, ContextTokens
+            # =V-for-B) — a cross-model pair, exactly what the lock was
+            # supposed to prevent.
+            #
+            # The prior atomic-refresh test at :303 is an ISOLATION test —
+            # no concurrency, asserts only single-value equality across a
+            # sequential three-point read. Move the probe back OUTSIDE the
+            # lock and prior tests still pass. That makes them a rubber-
+            # stamp for the atomic-pair claim; this test is the anti-
+            # rubber-stamp.
+            #
+            # PowerShell threading semantics don't allow a faithful
+            # concurrent-writer test in-process — Start-Job forks a new
+            # runspace with a FRESH copy of module state, so a second job
+            # cannot observe THIS runspace's $Script:F5RefreshLock at all.
+            # Fall back to a single-thread test that mocks
+            # `_ProbeContextTokensForHostStrict` to record
+            # $Script:F5RefreshLock.CurrentCount inside the probe body.
+            # SemaphoreSlim.CurrentCount is 0 when the lock is HELD (all
+            # slots taken) and 1 when free. Under 1fbf67c the recorded
+            # value must be 0 on every probe entry from the F5 branch.
+            # Under the prior af69a5d shape (probe BEFORE the .Wait()) the
+            # recorded value would be 1.
+            $script:ProbeLockCounts = [System.Collections.ArrayList]::new()
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') { return (New-ChatResponse -Content '{"ok":true}') }
+                throw "no fixture for $Uri"
+            }
+            Mock -ModuleName OllamaOffload _ProbeContextTokensForHostStrict {
+                param($Model, $BaseUrl)
+                # SemaphoreSlim.CurrentCount == 0 <=> lock is HELD.
+                [void]$script:ProbeLockCounts.Add([int]$Script:F5RefreshLock.CurrentCount)
+                return 8192
+            }
+            InModuleScope OllamaOffload {
+                # Prime the hint-era shape so the F5 branch fires.
+                $Script:Discovered = @{
+                    Model = $Script:DefaultModelHint
+                    ContextTokens = 262144
+                    KeepAlive = '5m'
+                    BaseUrl = 'http://test.invalid:11434'
+                }
+                $Script:DefaultModelSource = 'hint'
+            }
+            $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+
+            $script:ProbeLockCounts.Count | Should -BeGreaterOrEqual 1 `
+                -Because 'F5 branch must have exercised the strict probe — otherwise the test is inert'
+            foreach ($count in $script:ProbeLockCounts) {
+                $count | Should -Be 0 `
+                    -Because 'the strict probe must run INSIDE $Script:F5RefreshLock (CurrentCount == 0 means the semaphore is HELD); a value of 1 means the probe ran BEFORE the .Wait(), reopening the DA-r5 cross-model composition race'
+            }
+        }
+    }
+
     Context 'environment namespace' {
 
         It 'never reads Ollama own variables' {
