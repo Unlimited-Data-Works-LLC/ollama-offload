@@ -43,8 +43,10 @@ unparseable content`.
 
 ## What else it handles
 
-- **Runtime model discovery** — asks `/api/ps` what is actually loaded, then `/api/tags`, rather
-  than hardcoding a model name that goes stale.
+- **Runtime model discovery, per host** — asks the *resolved* host's `/api/ps` what is loaded,
+  then `/api/tags`. The discovery helpers accept a kwarg-only `base_url=` so a `-HostName`
+  override or a failover probes THAT host, not the module-active one. Nothing about a model name
+  is hardcoded on a reachable host (see [Model resolution](#model-resolution)).
 - **Runtime context discovery** — reads the model's real context window and sizes input against
   a per-consumer ratio of it. The architectural maximum from `/api/show` is often far larger
   than what is actually loaded under VRAM pressure, so using it over-fills prompts.
@@ -58,7 +60,8 @@ unparseable content`.
   cooldown armed by a Python caller is honoured by a PowerShell one. A backed-off endpoint
   should stay backed off regardless of which language noticed.
 - **Cross-host failover and rotation** — `primary`, `round_robin` or `weighted` across a
-  `hosts` map, with per-consumer host affinity.
+  `hosts` map, with per-consumer host affinity. See [Failover](#failover) for the exception
+  contract the orchestrator relies on.
 - **Structured output** — your JSON schema goes out as `/api/chat`'s `format` field, and
   required top-level keys are checked on the way back.
 
@@ -87,7 +90,7 @@ Python 3.10+ (`jsonschema` optional, for config validation). PowerShell 7+ for t
 ```json
 {
   "url": "http://localhost:11434/api/chat",
-  "model": "qwen3:8b"
+  "model": "qwen3.6:35b"
 }
 ```
 
@@ -97,13 +100,16 @@ Multi-host adds a map and a default:
 {
   "default_host": "primary",
   "hosts": {
-    "primary":   { "url": "http://localhost:11434/api/chat", "model": "qwen3:8b" },
-    "secondary": { "url": "http://ollama-2.internal:11434/api/chat", "model": "qwen3:8b" }
+    "primary":   { "url": "http://localhost:11434/api/chat", "model": "qwen3.6:35b" },
+    "secondary": { "url": "http://ollama-2.internal:11434/api/chat", "model": "qwen3.6:35b" }
   },
   "failover_hosts": ["secondary"],
   "strategy": "primary"
 }
 ```
+
+Omitting `model` on a host entry (or at the top level) is legal and now supported end-to-end:
+the client discovers the model live from that host's `/api/ps` on every call. See below.
 
 ### Consumers
 
@@ -133,7 +139,7 @@ a test asserting this library never reads them.
 | `OLLAMA_OFFLOAD_CONFIG` | read the config from this path instead of next to the module |
 | `OLLAMA_OFFLOAD_HOST` | pick a `hosts.<name>` entry |
 | `OLLAMA_OFFLOAD_URL` | raw `/api/chat` URL, bypassing the map |
-| `OLLAMA_OFFLOAD_MODEL` | override the discovered model |
+| `OLLAMA_OFFLOAD_MODEL` | override the discovered/pinned model (see [Model resolution](#model-resolution)) |
 | `OLLAMA_OFFLOAD_TIMEOUT_S` · `_TEMPERATURE` · `_CONTEXT_TOKENS` | override individual knobs |
 | `OLLAMA_OFFLOAD_THINK` · `_KEEP_ALIVE` | override the request fields |
 
@@ -141,16 +147,108 @@ A name given to `OLLAMA_OFFLOAD_HOST` that is not in the map raises `OllamaConfi
 than falling back — a typo that silently routes to the default host is indistinguishable from
 success, which is the worst property a routing bug can have.
 
+**Env-value stripping.** `OLLAMA_OFFLOAD_MODEL` is stripped at both read sites (import-time
+discovery and the per-call wire ladder). An empty string or a whitespace-only value counts as
+**UNSET** — it does not override anything, it falls through to the next tier. A non-empty
+stripped value wins over both the config pin and any discovered value. This behavior is
+test-locked in `tests/test_ollama_offload.py::TestNonCoincidentModelDiscovery`.
+
+## Model resolution
+
+The client picks a model for every call by walking a ladder, highest precedence first. Any
+tier that produces a non-empty value wins; the rest are skipped.
+
+1. **Per-call `model=` / `-Model` argument** — the caller's explicit intent for this one call.
+2. **`OLLAMA_OFFLOAD_MODEL` env var** — ops override or CI pin. Stripped on read; empty or
+   whitespace-only = UNSET.
+3. **Config-file pin** — `hosts.<name>.model` for the resolved host, else top-level `model`.
+4. **`/api/ps` on the target host** — the model *currently loaded and serving*, discovered live
+   via `_discover_model(base_url=<target>)`. This is per-host: a `-HostName` override or a
+   failover probes that host, not the module-active one.
+5. **`/api/tags` on the target host** — same discovery helper, if `/api/ps` returned nothing.
+6. **`_DEFAULT_MODEL_HINT`** (`qwen3.6:35b`) — **bootstrap only**. This tier fires only at
+   *import time* when the primary host is unreachable, so a caller can still construct the
+   module without a live Ollama. It **never ships to the wire on a reachable host**: the F5
+   guard in `_call_ollama_once` raises `OllamaUnavailable` rather than send a hint to a host
+   that answered a probe with no models.
+
+### Recovery after a bootstrap-time miss (F5)
+
+If the primary host was down at import (tier 6 fired and `_DEFAULT_MODEL_SOURCE == "hint"`), a
+later call that finds the primary back up **rewrites the module-globals**: `DEFAULT_MODEL` and
+`DEFAULT_CONTEXT_TOKENS` are refreshed atomically from the retry's live probe, so every
+subsequent call sees the recovered state and not the import-time hint. Without the paired
+context-tokens refresh, the `num_ctx` shortcut on the fast path would ship stale import-time
+tokens against the newly-discovered model — the `872de70` fix closes that gap.
+
+### Per-host discovery kwargs
+
+`_discover_model(*, base_url=None)` and `_discover_context_tokens(model, *, base_url=None)`
+accept a keyword-only `base_url=`. The default (`None`) preserves the module-active probe used
+at import; `_call_ollama_once` threads the resolved per-call `base_url` through both on every
+call so that the wire body's `model` and `options.num_ctx` describe the *actual* target host,
+even under `-HostName` override or failover.
+
 ## Errors
 
 ```
-OllamaCallError          the call completed and the answer was unusable (model fault)
-└── OllamaUnavailable    the host could not be reached, or is in cooldown (transport fault)
+OllamaCallError          base for call-time failures (schema-invalid content, model faults)
+└── OllamaUnavailable    the host could not be reached, is in cooldown, or discovery
+                         cannot find a real model on a reachable host — the failover
+                         orchestrator catches THIS class only
 OllamaConfigError        the configuration is wrong; retrying will not help
 ```
 
-Catch `OllamaCallError` to sweep both call-time branches. The subclass relationship is part of
-the contract.
+Catch `OllamaCallError` to sweep both call-time branches. The subclass relationship is part
+of the contract, and it is load-bearing: the failover orchestrator catches
+`OllamaUnavailable` specifically so that a **model** fault on one host does not silently
+route the same broken prompt to the next. Only **transport-shaped** faults (unreachable,
+cooldown, hint-only-discovery) propagate to the next host in the chain.
+
+## Failover
+
+`call_ollama` (Python) and `Invoke-OllamaCall` (PowerShell) walk an ordered chain of
+`[primary, ...failover_hosts]`, deduplicated. For each host:
+
+1. The per-call `base_url` is threaded through model + context discovery — every host gets its
+   own live probe, not the module-active one's cached answers.
+2. A **transport fault** (`OllamaUnavailable`) causes the orchestrator to try the next host.
+   This includes: connection refused, timeout, per-host cooldown, and the F5 case where
+   the host answered a probe but neither `/api/ps` nor `/api/tags` yielded an installed model
+   and the caller supplied no `OLLAMA_OFFLOAD_MODEL` / config pin.
+3. A **model fault** (`OllamaCallError` but *not* `OllamaUnavailable`) bubbles up unchanged —
+   the host served content, so failover to a different host would just repeat the bad prompt.
+4. `OllamaConfigError` (bad name, missing config) bubbles up unchanged.
+
+If every host in the chain fails, `OllamaUnavailable` is raised naming the chain that was
+tried.
+
+## Testing
+
+Both suites are fully offline against canned fixtures. A test suite that needs a GPU is a
+suite nobody runs.
+
+```bash
+python3 -m unittest discover -s tests
+```
+```powershell
+Invoke-Pester ./tests
+```
+
+The model-resolution contract is locked in
+`tests/test_ollama_offload.py::TestNonCoincidentModelDiscovery` — 19 assertions covering:
+
+- **Non-coincident model discovery** — `/api/ps` returns a model that differs from the config
+  pin; the discovered model wins and reaches the wire body.
+- **Config-pin-wins-over-discovered** — a config pin beats `/api/ps` (tier 3 above tier 4).
+- **Whitespace-only env** — `OLLAMA_OFFLOAD_MODEL="   "` counts as UNSET.
+- **Empty-string env** — `OLLAMA_OFFLOAD_MODEL=""` counts as UNSET.
+- **`_discover_model` direct strip** — the strip happens inside the helper too, not only at
+  the wire ladder read site.
+- **Mid-run primary recovery** — two-call sequence: primary down at import, primary back up on
+  call 2, `DEFAULT_MODEL` is rewritten from the recovered probe.
+- **`num_ctx` refresh on recovery** — the paired `DEFAULT_CONTEXT_TOKENS` refresh, without
+  which the fast-path `num_ctx == DEFAULT_MODEL` shortcut would ship stale tokens.
 
 ## The twins
 
@@ -163,16 +261,6 @@ from this codebase: `/api/show` returns `parameters` as a **newline-delimited st
 object. Python's `.get()` on it quietly returns `None` and carries on. PowerShell under
 `Set-StrictMode -Version Latest` *throws*. Identical code shape, divergent behaviour, and only
 one side fails loudly — the sharpest form of drift there is, and invisible to code review.
-
-The suites mirror each other case for case, and both run fully offline against canned fixtures.
-A test suite that needs a GPU is a suite nobody runs.
-
-```bash
-python3 -m unittest discover -s tests      # 9 tests
-```
-```powershell
-Invoke-Pester ./tests                      # 7 tests
-```
 
 ## License
 
