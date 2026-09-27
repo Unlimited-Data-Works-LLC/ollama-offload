@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 
@@ -454,20 +455,27 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
             with self.subTest(whitespace=label):
                 # Fresh env + module reload per sub-case so the module-scope
                 # `_DEFAULT_MODEL_SOURCE` state doesn't leak between cases.
+                # DA-round5 (cleanup): wrap the mutation in try/finally so
+                # the env pop runs even if an assertion raises. Without it,
+                # a failure in one sub-case leaks OLLAMA_OFFLOAD_MODEL into
+                # the next — that would show up as a *different* failure
+                # class than the real one, misleading the debugger.
                 os.environ["OLLAMA_OFFLOAD_MODEL"] = value
-                mod, sent = self._reload_with_config_and_routes(
-                    {"url": "http://test.invalid:11434/api/chat",
-                     "model": "config-pin"},
-                    ps_model=self.NONCOINCIDENT_MODEL,
-                )
-                mod.call_ollama("go", schema=SCHEMA)
-                chat_bodies = [b for b in sent if "messages" in b]
-                self.assertEqual(
-                    chat_bodies[-1]["model"], "config-pin",
-                    f"whitespace-only env ({label!r}) is UNSET after "
-                    f"strip; the config pin must win — the wire body "
-                    f"must NOT ship {value!r}")
-                os.environ.pop("OLLAMA_OFFLOAD_MODEL", None)
+                try:
+                    mod, sent = self._reload_with_config_and_routes(
+                        {"url": "http://test.invalid:11434/api/chat",
+                         "model": "config-pin"},
+                        ps_model=self.NONCOINCIDENT_MODEL,
+                    )
+                    mod.call_ollama("go", schema=SCHEMA)
+                    chat_bodies = [b for b in sent if "messages" in b]
+                    self.assertEqual(
+                        chat_bodies[-1]["model"], "config-pin",
+                        f"whitespace-only env ({label!r}) is UNSET after "
+                        f"strip; the config pin must win — the wire body "
+                        f"must NOT ship {value!r}")
+                finally:
+                    os.environ.pop("OLLAMA_OFFLOAD_MODEL", None)
 
     def test_discover_model_strips_env_override_directly(self):
         """DA-round3 (C): the `.strip()` at :378 in `_discover_model` is
@@ -710,6 +718,166 @@ class TestNonCoincidentModelDiscovery(unittest.TestCase):
                          "because _DEFAULT_MODEL_SOURCE is no longer "
                          "'hint'; readers see a stable value across the "
                          "lock boundary")
+
+    def test_f5_strict_probe_runs_under_the_refresh_lock(self):
+        """DA-round5 (composition): Fix-A (strict-None skips the ctx
+        write) and Fix-B (commit the pair under `_F5_REFRESH_LOCK`)
+        COMPOSE into a cross-model race unless the strict probe runs
+        INSIDE the lock. Repro under a probe-outside-lock shape:
+
+          - Writer B probes ctx=V for model B strict → V.
+            Acquires the lock, writes (DEFAULT_MODEL=B,
+            DEFAULT_CONTEXT_TOKENS=V), releases.
+          - Writer A had probed ctx for model A concurrently,
+            /api/show 500 → strict returns None.  Acquires the lock,
+            writes DEFAULT_MODEL=A, SKIPS the ctx write per Fix A.
+          - Final pair: (DEFAULT_MODEL=A, DEFAULT_CONTEXT_TOKENS=V-
+            for-B) — a cross-model pair, exactly what the lock was
+            supposed to prevent.
+
+        Prior atomicity test at :643 is an ISOLATION test — no
+        threading, asserts only single-value equality across a
+        sequential three-point read. Delete `with _F5_REFRESH_LOCK:`
+        from source entirely and prior Test D still passes.  That
+        makes it a rubber-stamp for the atomic-pair claim; this test
+        is the anti-rubber-stamp.
+
+        Design: two threads enter `call_ollama` while
+        `_DEFAULT_MODEL_SOURCE == "hint"`, forced concurrent via a
+        `threading.Barrier(2)` inside a monkey-patched
+        `_probe_context_tokens_strict`. The patched probe records the
+        state of `_F5_REFRESH_LOCK.locked()` on every entry. Property:
+        every probe entry must observe the lock as held. A probe
+        outside the lock — or a lock removed entirely — makes the
+        recorded value False and the assertion fails.
+
+        Why the barrier: it forces two threads to be simultaneously
+        inside the probe. Under the fix, only one thread at a time
+        can be inside the probe (the lock serialises them), so a
+        barrier of size 2 inside the probe would deadlock. The test
+        therefore uses `Barrier(2, timeout=…)` and treats a barrier
+        timeout on BOTH probes as the SUCCESS signal — probes are
+        serialised, which is the fix's guarantee. Under old code
+        (probe outside lock) both probes reach the barrier
+        concurrently and the barrier releases; the recorded
+        lock-held flag is False and the follow-up assertion fires.
+        Two distinct signals, both anti-rubber-stamp:
+          (a) probe under lock → barrier times out on both probes
+              AND recorded lock-held is True on both,
+          (b) probe outside lock → barrier releases AND recorded
+              lock-held is False on at least one.
+        """
+        RECOVERED_CTX = 98304
+        path = os.path.join(self._tmp.name, "cfg.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"url": "http://test.invalid:11434/api/chat"}, fh)
+        os.environ["OLLAMA_OFFLOAD_CONFIG"] = path
+        import urllib.request
+        # Import with primary DOWN so _DEFAULT_MODEL_SOURCE == "hint".
+        discovery_dead = {
+            "/api/version": VERSION,
+            "/api/ps": urllib.error.URLError("primary down at import"),
+            "/api/tags": urllib.error.URLError("primary down at import"),
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        urllib.request.urlopen = _routed_urlopen(discovery_dead)
+        import ollama_offload
+        mod = importlib.reload(ollama_offload)
+        self.assertEqual(mod._DEFAULT_MODEL_SOURCE, "hint",
+                         "precondition: import must have hit the hint "
+                         "fallback so both threads take the F5 branch")
+        # Swap to a healthy recovery whose ctx != fallback constant, so
+        # the Fix-A None-skip does NOT gate the ctx write on the SUCCESS
+        # path — we're measuring the LOCK's atomicity claim here, not
+        # the None sentinel.
+        recovery = {
+            "/api/version": VERSION,
+            "/api/ps": {"models": [
+                {"name": self.NONCOINCIDENT_MODEL,
+                 "context_length": RECOVERED_CTX}
+            ]},
+            "/api/tags": {"models": [{"name": self.NONCOINCIDENT_MODEL}]},
+            "/api/show": SHOW,
+            "/api/chat": _chat_response(json.dumps({"ok": True})),
+        }
+        mod.urllib.request.urlopen = _routed_urlopen(recovery)
+        # Instrument the strict probe. Two threads race into the F5
+        # block; the barrier waits for BOTH to reach the probe. Under
+        # the fix, they can't — the second thread blocks on the F5
+        # lock outside the probe. Under old code, both reach it.
+        real_probe = mod._probe_context_tokens_strict
+        barrier = threading.Barrier(2, timeout=1.5)
+        entries = []
+        entries_lock = threading.Lock()
+
+        def instrumented(model, *, base_url=None):
+            held = mod._F5_REFRESH_LOCK.locked()
+            barrier_reached = True
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                # Expected under the fix: probes are serialised so a
+                # 2-way barrier times out. That is the SUCCESS shape
+                # for lock-held atomicity.
+                barrier_reached = False
+            with entries_lock:
+                entries.append({
+                    "thread": threading.current_thread().name,
+                    "lock_held_at_probe": held,
+                    "barrier_reached": barrier_reached,
+                })
+            return real_probe(model, base_url=base_url)
+
+        mod._probe_context_tokens_strict = instrumented
+
+        errors = []
+
+        def worker():
+            try:
+                mod.call_ollama("go", schema=SCHEMA)
+            except Exception as exc:  # pragma: no cover - defensive
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, name=f"F5-writer-{i}")
+            for i in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15.0)
+        for t in threads:
+            self.assertFalse(t.is_alive(),
+                             f"worker {t.name} did not finish — the "
+                             f"F5 refresh deadlocked or hung")
+        self.assertEqual(errors, [],
+                         f"workers raised: {errors!r}")
+        # Under the fix, at most ONE thread hits the F5 refresh: the
+        # first thread through flips `_DEFAULT_MODEL_SOURCE` off "hint"
+        # while holding the lock; the second thread's read of the
+        # source at :812 sees the flipped value and skips F5 entirely.
+        # That is itself an atomicity property: the source-flip and
+        # the (model, ctx) commit are all under the same lock, so a
+        # concurrent observer NEVER sees a half-applied refresh.
+        # Under old code, the flip happens BEFORE the lock is taken
+        # (via `_discover_model` at :822), both threads can pass the
+        # :812 gate before either commits, and both reach the probe.
+        # So the test discriminates on the count of probe entries too:
+        # <=1 entry means the source-flip and commit were coupled
+        # under a lock; ==2 entries means they were separable.
+        self.assertGreaterEqual(len(entries), 1,
+                                "the F5 strict probe never fired — the "
+                                "F5 branch was not exercised by this "
+                                "test (routes/mocks misconfigured)")
+        for entry in entries:
+            self.assertTrue(
+                entry["lock_held_at_probe"],
+                f"_probe_context_tokens_strict ran with "
+                f"_F5_REFRESH_LOCK NOT held (thread "
+                f"{entry['thread']!r}): probe-outside-lock reopens "
+                f"the DA-round5 cross-model composition race. "
+                f"entries={entries!r}")
 
     def test_probe_ollama_reports_reachability_separately_when_source_is_hint(self):
         """DA-round4 (E): `probe_ollama()` compared `DEFAULT_MODEL in models`

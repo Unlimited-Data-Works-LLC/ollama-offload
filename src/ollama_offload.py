@@ -846,8 +846,8 @@ def _call_ollama_once(
         # function fails-open to `_CFG["context_tokens_fallback"]` on any
         # throw. No recursion: `_discover_context_tokens` never re-enters
         # `_call_ollama_once` or `_discover_model`.
-        # DA-round4 (A+B): probe context into a LOCAL first, THEN commit both
-        # writes together under `_F5_REFRESH_LOCK`. Two coupled fixes:
+        # DA-round4 (A+B) + DA-round5 (composition): probe context and commit
+        # BOTH writes atomically under `_F5_REFRESH_LOCK`. Three coupled fixes:
         #   A — `_probe_context_tokens_strict` returns None when the probe
         #       fell through to the fallback constant (transient /api/show
         #       500, model not in /api/ps yet). Writing that fallback back
@@ -857,15 +857,25 @@ def _call_ollama_once(
         #   B — the prior shape wrote DEFAULT_MODEL, then BLOCKED up to ~10s
         #       inside `_discover_context_tokens`, then wrote
         #       DEFAULT_CONTEXT_TOKENS. A concurrent reader between the two
-        #       writes saw (new model, old tokens). Probe-into-local FIRST
-        #       (before taking the lock, since the network call is long),
-        #       then commit both writes under the lock so a concurrent
-        #       writer cannot interleave the pair.
-        _new_ctx = _probe_context_tokens_strict(
-            _effective_model, base_url=_call_base
-        )
+        #       writes saw (new model, old tokens).
+        #   composition (DA-round5) — Fix-A's None-skip and Fix-B's
+        #       under-lock-commit COMPOSE into a race when the probe is
+        #       taken OUTSIDE the lock. Repro: writer B probes ctx=98304
+        #       for model B, takes lock, writes (model=B, ctx=98304).
+        #       Writer A concurrently probes strict → None (transient 500),
+        #       takes lock, writes model=A but SKIPS the ctx write per
+        #       Fix A. Final pair: (DEFAULT_MODEL=A, DEFAULT_CONTEXT_TOKENS
+        #       =98304-belongs-to-B) — a cross-model pair, exactly what the
+        #       lock was supposed to prevent. Fix: probe INSIDE the lock,
+        #       so A's probe runs after B releases and sees fresh state,
+        #       or A's None-skip preserves B's self-consistent pair.
+        #       Trade-off: lock held ~10s during strict probe. F5 is a
+        #       rare, slow recovery path; the extended hold is intended.
         global DEFAULT_MODEL, DEFAULT_CONTEXT_TOKENS
         with _F5_REFRESH_LOCK:
+            _new_ctx = _probe_context_tokens_strict(
+                _effective_model, base_url=_call_base
+            )
             DEFAULT_MODEL = _effective_model
             if _new_ctx is not None:
                 DEFAULT_CONTEXT_TOKENS = _new_ctx
