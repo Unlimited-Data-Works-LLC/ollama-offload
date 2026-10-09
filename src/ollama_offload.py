@@ -24,6 +24,7 @@ the shape is right; it says nothing about whether the answer is.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
@@ -302,27 +303,13 @@ _DEFAULT_THINK: bool | None = _resolve_default_think()
 def _resolve_default_keep_alive() -> int | str | None:
     """Resolve the module-level default for Ollama /api/chat `keep_alive`.
 
-    Precedence: `OLLAMA_OFFLOAD_KEEP_ALIVE` → `_CFG.get("keep_alive")` →
-    ``-1`` (integer, resident). Set this explicitly on every call. Leaving it
-    out lets the server apply its own ``"5m"`` default, which overrides any
-    TTL you pinned elsewhere and evicts a warm model between calls — measured
-    here as a 13.2 s cold-load stall that presented as a slow model rather
-    than as an eviction.
+    Precedence: `OLLAMA_OFFLOAD_KEEP_ALIVE` -> `_CFG["keep_alive"]` -> ``"auto"`` when the key is absent.
 
-    Ollama's ``keep_alive`` field accepts either an INTEGER (seconds,
-    with ``-1`` meaning "keep forever" and ``0`` meaning "unload
-    immediately") OR a duration STRING like ``"30m"`` / ``"1h"``. A
-    string ``"-1"`` is REJECTED with HTTP 400 ``time: missing unit in
-    duration "-1"`` because Ollama parses string values as Go
-    ``time.Duration`` (which requires a unit suffix). The integer form
-    is the canonical way to say "forever."
-
-    The default is the integer ``-1``: this client owns the model-lifetime
-    decision, and a caller wanting a bounded TTL passes an explicit
-    ``keep_alive="30m"`` or ``keep_alive=1800``. An env override that parses
-    as an integer is sent as one; anything else is treated as a duration
-    string. An explicit ``None`` in config stays None, the same tri-state as
-    ``think``, for callers who want the field omitted.
+    ``"auto"`` is resolved per call by :func:`_policy_keep_alive`: conform to the loaded model (re-assert int
+    -1 only for a Forever pin, else send no field). An explicit value is sent as given. Ollama's keep_alive
+    accepts an INTEGER (seconds; -1 = forever, 0 = unload now) or a duration STRING like "30m". The string
+    "-1" is REJECTED with HTTP 400 (Go time.Duration needs a unit), so an env value that parses as an integer
+    is sent as one. An explicit ``None`` in config stays None (no field), the same tri-state as ``think``.
     """
     for src in (os.environ.get("OLLAMA_OFFLOAD_KEEP_ALIVE"),):
         if src is None or src == "":
@@ -333,7 +320,7 @@ def _resolve_default_keep_alive() -> int | str | None:
         except ValueError:
             return s
     if "keep_alive" not in _CFG:
-        return -1
+        return "auto"
     cfg_val = _CFG.get("keep_alive")
     if cfg_val is None:
         return None
@@ -347,6 +334,80 @@ def _resolve_default_keep_alive() -> int | str | None:
 
 
 _DEFAULT_KEEP_ALIVE: int | str | None = _resolve_default_keep_alive()
+
+
+def _model_key(name: str) -> str:
+    """Ollama resolves an untagged name to ':latest' server-side ("qwen3" IS "qwen3:latest"), so compare names
+    with the implicit tag made explicit. Without this, a caller naming "qwen3" never matched /api/ps's
+    "qwen3:latest" and a Forever pin was silently dropped."""
+    n = str(name or "").strip()
+    return n if (":" in n.rsplit("/", 1)[-1]) else n + ":latest"
+
+
+def _keepalive_memo_path(base: str) -> Path:
+    """Sidecar remembering the last CONFIRMED Forever decision per (host, model). Lives beside the cooldown
+    sidecars under TEMP and is shared with the PowerShell twin, so it survives across processes (a consumer
+    that spawns one process per call has no in-memory history)."""
+    return Path(os.environ.get("TEMP", "/tmp")) / f"ollama_offload_keepalive.{_sanitize_host_for_path(base)}.json"
+
+
+def _policy_keep_alive(model: str, *, base_url: str | None = None) -> int | None:
+    """Resolve keep_alive "auto" for one call: CONFORM to the loaded model, never impose.
+
+    Every /api/chat call writes the host-global residency timer of the model it names, and an absent field
+    is NOT a neutral "leave it alone" (the server re-arms its own short default). So a client can only keep a
+    Forever pin by re-asserting it, and can only avoid creating one by not sending -1. Policy:
+
+    - /api/ps answered and lists the model with a Forever ``expires_at`` (year > 2100): send int ``-1``.
+    - /api/ps answered, and the model has a finite TTL or is not loaded: return ``None`` (NO field).
+    - /api/ps could NOT be read (timeout, 5xx): reuse the last CONFIRMED decision for this host and model,
+      from the sidecar. Omitting on a probe error is not the safe side: one busy-host timeout would end an
+      operator's Forever pin, and nothing would ever re-assert it. With no record yet, send no field.
+
+    Always sending -1 (the old default) turned any short-lived load, including a model this client picked
+    from /api/tags, into a permanent pin on a shared GPU.
+    """
+    base = base_url if base_url is not None else _api_base()
+    key = _model_key(model)
+    memo = _keepalive_memo_path(base)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base + "/api/ps"), timeout=5) as resp:
+            ps = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        try:
+            return -1 if json.loads(memo.read_text(encoding="utf-8")).get(key) is True else None
+        except Exception:
+            return None
+    forever = False
+    for m in ps.get("models") or []:
+        if key in (_model_key(m.get("name", "")), _model_key(m.get("model", ""))):
+            try:
+                forever = int(str(m.get("expires_at") or "")[:4]) > 2100
+            except ValueError:
+                forever = False
+            break
+    try:
+        seen = json.loads(memo.read_text(encoding="utf-8"))
+        if not isinstance(seen, dict):
+            seen = {}
+    except Exception:
+        seen = {}  # missing, empty or corrupt: start over. Skipping the write would leave it bad for good.
+    seen[key] = forever
+    try:
+        # Atomic: write a sibling temp file, then replace. Two processes (or two twins) writing at once must
+        # never leave a torn file; os.replace is atomic on the same volume.
+        tmp = memo.with_name(f"{memo.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(seen), encoding="utf-8")
+        os.replace(tmp, memo)
+    except Exception:
+        # The memo is a hint; failing to write it is not fatal. But do not leave the temp file behind: with
+        # one process per call, a busy period would litter TEMP (os.replace fails while a reader
+        # holds the memo open on Windows).
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return -1 if forever else None
 
 
 def _api_base() -> str:
@@ -461,7 +522,7 @@ def _probe_context_tokens_strict(model: str, *, base_url: str | None = None) -> 
         with urllib.request.urlopen(urllib.request.Request(base + "/api/ps"), timeout=5) as resp:
             ps = json.loads(resp.read().decode("utf-8"))
         for m in ps.get("models") or []:
-            if m.get("name") == model or m.get("model") == model:
+            if _model_key(model) in (_model_key(m.get("name", "")), _model_key(m.get("model", ""))):
                 ctx = m.get("context_length")
                 if isinstance(ctx, int) and ctx > 0:
                     return ctx
@@ -564,6 +625,22 @@ def context_bytes(ratio: float, *, chars_per_token: int = 4) -> int:
 
 class OllamaCallError(RuntimeError):
     """Any failure talking to the Ollama host / parsing/validating the response."""
+
+
+class OllamaPromptTooLarge(OllamaCallError):
+    """The prompt (plus system prompt) is larger than ``input_ratio`` x the num_ctx this call would send.
+    Raised BEFORE sending: nothing is cut and nothing is sent. Not an OllamaUnavailable: the host is fine, so
+    no cooldown is armed and the failover orchestrator does not try the next host. The caller trims its own
+    input (it knows what is safe to drop) or fails the item. Attributes: chars, budget, ratio,
+    context_tokens, context_confirmed (False = context_tokens is the configured fallback, not a reading)."""
+
+    def __init__(self, *, chars: int, budget: int, ratio: float, context_tokens: int, context_confirmed: bool):
+        self.chars, self.budget, self.ratio = chars, budget, ratio
+        self.context_tokens, self.context_confirmed = context_tokens, context_confirmed
+        super().__init__(
+            f"prompt too large: {chars} chars > budget {budget} (ratio {ratio} of a {context_tokens}-token window"
+            f"{'' if context_confirmed else ', the FALLBACK window: no live reading'}); nothing was sent or cut"
+        )
 
 
 class OllamaUnavailable(OllamaCallError):
@@ -737,6 +814,8 @@ def _call_ollama_once(
     temperature: float | None = None,
     logprobs: bool = False,
     top_logprobs: int | None = 5,
+    input_ratio: float | None = None,
+    chars_per_token: int = 4,
 ) -> dict | str:
     """Single-shot Ollama call — one host, no failover.
 
@@ -768,6 +847,18 @@ def _call_ollama_once(
         _call_host = _ACTIVE_HOST
     _call_url = _call_host["url"]
     _call_base = _call_url.rsplit("/api/", 1)[0]
+    # The cooldown is checked FIRST, before any discovery probe: a benched host is not probed again (each
+    # probe to a dead host costs its timeout). It used to run after model/context resolution.
+    # persistent per-host cooldown check. Reads the
+    # per-host sidecar OR the legacy GLOBAL sidecar (backward-compat "all
+    # benched" signal). Skips until whichever is furthest-in-the-future lapses.
+    in_cd, remaining = _in_cooldown_for(_call_host["name"])
+    if in_cd:
+        raise OllamaUnavailable(
+            f"Ollama host={_call_host['name']} in cooldown for {remaining:.0f}s "
+            f"more (touch/rm {_cooldown_path_for(_call_host['name'])} to clear "
+            f"the per-host sidecar; {_COOLDOWN_PATH} clears the legacy global)"
+        )
     # Precedence (highest first, per README:136 + docstring at :55-60):
     #   1. explicit ``model=`` per-call arg — caller's explicit intent
     #   2. OLLAMA_OFFLOAD_MODEL env — ops override / CI pin
@@ -803,6 +894,11 @@ def _call_ollama_once(
         # the reachable secondary could not answer — treat as unavailable
         # so the failover orchestrator (fix iv) walks to the next host.
         if _DEFAULT_MODEL_SOURCE == "hint":
+            if not ollama_alive(base_url=_call_base):
+                # Discovery failed because the host does not answer at all: bench it, as any transport
+                # failure does, so later calls short-circuit on the cooldown instead of re-probing.
+                _set_cooldown_for(_call_host["name"], "unreachable during model discovery")
+                raise OllamaUnavailable(f"Ollama unreachable at {_call_base} (model discovery); per-host cooldown engaged")
             raise OllamaUnavailable(
                 f"model discovery fell back to _DEFAULT_MODEL_HINT for host="
                 f"{_call_host['name']} at {_call_base}. Set OLLAMA_OFFLOAD_MODEL, "
@@ -824,6 +920,11 @@ def _call_ollama_once(
             # DA-round2 (iii): was OllamaCallError, which the failover
             # orchestrator at :1220 does NOT catch (only OllamaUnavailable).
             # A hint-fallback on primary must let failover_hosts be walked.
+            if not ollama_alive(base_url=_call_base):
+                # Discovery failed because the host does not answer at all: bench it, as any transport
+                # failure does, so later calls short-circuit on the cooldown instead of re-probing.
+                _set_cooldown_for(_call_host["name"], "unreachable during model discovery")
+                raise OllamaUnavailable(f"Ollama unreachable at {_call_base} (model discovery); per-host cooldown engaged")
             raise OllamaUnavailable(
                 f"model discovery fell back to _DEFAULT_MODEL_HINT for host="
                 f"{_call_host['name']} at {_call_base}. Set OLLAMA_OFFLOAD_MODEL, "
@@ -908,17 +1009,6 @@ def _call_ollama_once(
         else _discover_context_tokens(_effective_model, base_url=_call_base)
     )
 
-    # persistent per-host cooldown check. Reads the
-    # per-host sidecar OR the legacy GLOBAL sidecar (backward-compat "all
-    # benched" signal). Skips until whichever is furthest-in-the-future lapses.
-    in_cd, remaining = _in_cooldown_for(_call_host["name"])
-    if in_cd:
-        raise OllamaUnavailable(
-            f"Ollama host={_call_host['name']} in cooldown for {remaining:.0f}s "
-            f"more (touch/rm {_cooldown_path_for(_call_host['name'])} to clear "
-            f"the per-host sidecar; {_COOLDOWN_PATH} clears the legacy global)"
-        )
-
     # Pre-flight the RESOLVED host's base URL, not the module-cached one.
     # A per-call override to a dead ad-hoc host would otherwise pre-flight
     # the module host + succeed, then blow up in the retry loop.
@@ -928,6 +1018,20 @@ def _call_ollama_once(
             f"ollama_alive pre-flight failed for host={_call_host['name']}",
         )
         raise OllamaUnavailable(f"Ollama unreachable at {_call_base}")
+
+    # Budget refusal (opt-in: input_ratio). AFTER the cooldown check and the pre-flight above, so a down or
+    # benched host is OllamaUnavailable, never "too large". Against the num_ctx THIS call will send, not a
+    # separately probed value: the two can differ, and budgeting from the other one let an oversize prompt
+    # through to be cut by the server.
+    if input_ratio is not None:
+        _budget = int(_effective_context_tokens * float(input_ratio) * chars_per_token)
+        _chars = len(task_prompt) + len(system or "")
+        if _chars > _budget:
+            _strict = _probe_context_tokens_strict(_effective_model, base_url=_call_base)
+            raise OllamaPromptTooLarge(
+                chars=_chars, budget=_budget, ratio=float(input_ratio), context_tokens=_effective_context_tokens,
+                context_confirmed=_strict is not None and _strict == _effective_context_tokens,
+            )
 
     messages = []
     if system:
@@ -975,6 +1079,8 @@ def _call_ollama_once(
     # an explicit config None sends no field, byte-for-byte compat with
     # pre-`keep_alive` behavior for callers that opt back out.
     _effective_keep_alive = keep_alive if keep_alive is not None else _DEFAULT_KEEP_ALIVE
+    if isinstance(_effective_keep_alive, str) and _effective_keep_alive.strip().lower() == "auto":
+        _effective_keep_alive = _policy_keep_alive(_effective_model, base_url=_call_base)
     if _effective_keep_alive is not None:
         body["keep_alive"] = _effective_keep_alive
 
@@ -1048,6 +1154,14 @@ def _call_ollama_once(
         raise OllamaCallError(
             f"Ollama content wasn't valid JSON (elapsed {elapsed:.1f}s): {e}\nRaw: {content[:400]}"
         ) from e
+
+    # The reply parsed, but a schema call promises a JSON OBJECT. A bare 42, a list or a string would make the
+    # required-key check below raise TypeError (`key not in 42`), which escapes as a crash instead of the model
+    # fault it is. Raise it as one: OllamaCallError, no retry, no cooldown (the host answered).
+    if not isinstance(obj, dict):
+        raise OllamaCallError(
+            f"Ollama content was JSON but not an object ({type(obj).__name__}); a schema call needs an object. Raw: {content[:400]}"
+        )
 
     # Minimal schema validation: check required top-level keys are present. Deep validation
     # is the consumer's job (each has its own domain checks); we just ensure the model
@@ -1210,6 +1324,8 @@ def call_ollama(
     temperature: float | None = None,
     logprobs: bool = False,
     top_logprobs: int | None = 5,
+    input_ratio: float | None = None,
+    chars_per_token: int = 4,
 ) -> dict | str:
     """Call Ollama with optional cross-host failover.
 
@@ -1295,6 +1411,7 @@ def call_ollama(
             think=think, keep_alive=keep_alive, host=host,
             temperature=temperature,
             logprobs=logprobs, top_logprobs=top_logprobs,
+            input_ratio=input_ratio, chars_per_token=chars_per_token,
         )
     # db-sme Batch-2 NTH#2 fold: legacy global cooldown active → skip the
     # whole chain (every host is benched by the global OR-read semantic).
@@ -1327,6 +1444,7 @@ def call_ollama(
                 think=think, keep_alive=keep_alive, host=h,
                 temperature=temperature,
                 logprobs=logprobs, top_logprobs=top_logprobs,
+                input_ratio=input_ratio, chars_per_token=chars_per_token,
             )
             if isinstance(result, dict) and i > 0:
                 # Failover fired — record the actual chain traversed for
@@ -1435,6 +1553,74 @@ def probe_ollama() -> tuple[bool, str]:
         return False, f"Ollama reachable but {DEFAULT_MODEL} missing; found: {models}"
     except Exception as e:
         return False, f"Ollama unreachable at {tags_url}: {e}"
+
+
+
+def status() -> dict:
+    """What this module will do on the next call to the ACTIVE host, as a public, stable read.
+
+    Keys (the PowerShell twin's Get-OllamaStatus returns the same names):
+      host              resolved active host name ('<env-url>' for a raw OLLAMA_OFFLOAD_URL)
+      base_url          that host's API root
+      model             the model a call would send (DEFAULT_MODEL)
+      model_source      where it came from: env | ps | tags | cfg | hint (see _DEFAULT_MODEL_SOURCE)
+      context_tokens    the num_ctx a call would send for that model
+      context_confirmed True only when a fresh strict probe reads a window AND it equals context_tokens.
+                        False means context_tokens is the configured fallback, or the host now reports a
+                        different window: size input conservatively, or re-import.
+      cooldown_s        seconds of per-host (or legacy global) cooldown left; 0 = callable
+
+    Costs one strict context probe (/api/ps, then /api/show if needed). Consumers should read THIS, not the
+    private names it is built from.
+    """
+    global _DEFAULT_MODEL_SOURCE  # restored after a hint-path probe; see below
+    host = _ACTIVE_HOST["name"]
+    base = _api_base()
+    # The SAME ladder _call_ollama_once walks for a call with no per-call model= (env > host/config pin >
+    # discovered), so status() reports what the wire would carry, not just what discovery found.
+    env_model = os.environ.get("OLLAMA_OFFLOAD_MODEL", "").strip()
+    if env_model:
+        model, source = env_model, "env"
+    elif _ACTIVE_HOST.get("model"):
+        model, source = _ACTIVE_HOST["model"], "cfg"
+    elif _DEFAULT_MODEL_SOURCE == "hint":
+        # A call re-discovers when startup discovery fell back to the hint, before sending; report what IT would find. WITHOUT side
+        # effects: _discover_model writes the module-level source, and leaving it "ps" while DEFAULT_MODEL is
+        # still the hint made the NEXT call skip that recovery and send the hint. Probe, read, restore.
+        _saved_source = _DEFAULT_MODEL_SOURCE
+        try:
+            model = _discover_model(base_url=base)
+            source = _DEFAULT_MODEL_SOURCE
+        finally:
+            _DEFAULT_MODEL_SOURCE = _saved_source
+    else:
+        model, source = DEFAULT_MODEL, _DEFAULT_MODEL_SOURCE
+    sent = DEFAULT_CONTEXT_TOKENS if model == DEFAULT_MODEL else _discover_context_tokens(model, base_url=base)
+    strict = _probe_context_tokens_strict(model, base_url=base)
+    in_cd, remaining = _in_cooldown_for(host)
+    return {
+        "host": host,
+        "base_url": base,
+        "model": model,
+        "model_source": source,
+        "context_tokens": sent,
+        "context_confirmed": strict is not None and strict == sent,
+        "cooldown_s": int(math.ceil(remaining)) if in_cd else 0,
+    }
+
+
+def clear_cooldown() -> list[str]:
+    """Remove the ACTIVE host's per-host cooldown sidecar and the legacy global one. Returns the paths
+    removed (empty when none was armed). Shared with the PowerShell twin's Clear-OllamaCooldown: both twins
+    read the same files."""
+    removed = []
+    for path in (_cooldown_path_for(_ACTIVE_HOST["name"]), _COOLDOWN_PATH):
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            pass
+    return removed
 
 
 if __name__ == "__main__":

@@ -134,6 +134,17 @@ class TestFaultSeparation(OllamaOffloadTestCase):
         in_cooldown, _ = self.mod._in_cooldown_for(self.mod.active_host_name())
         self.assertFalse(in_cooldown, "a model fault must never bench the endpoint")
 
+    def test_json_that_is_not_an_object_is_a_model_fault(self):
+        """A schema reply that parses but is not a JSON object (42, ["v"]) used to raise TypeError inside the
+        required-key check. It is the model's fault: OllamaCallError, not Unavailable, and no cooldown."""
+        for reply in ("42", '["ok"]', '"ok"', "null"):
+            self._install({**HEALTHY, "/api/chat": _chat_response(reply)})
+            with self.assertRaises(self.mod.OllamaCallError, msg=reply) as ctx:
+                self.mod.call_ollama("go", schema=SCHEMA)
+            self.assertNotIsInstance(ctx.exception, self.mod.OllamaUnavailable)
+            in_cooldown, _ = self.mod._in_cooldown_for(self.mod.active_host_name())
+            self.assertFalse(in_cooldown, reply)
+
     def test_transport_failure_arms_cooldown(self):
         """A connection failure IS a host fault, and must bench the host."""
         self.mod._BASE_BACKOFF_S = 0  # keep the retry loop instant
@@ -171,10 +182,78 @@ class TestWireBody(OllamaOffloadTestCase):
         self.assertIn("temperature", body["options"])
         self.assertIn("num_ctx", body["options"])
 
-    def test_keep_alive_is_sent_explicitly(self):
-        """Omitting keep_alive lets the server apply its own default and evict the model."""
-        _, body = self._call_and_capture()
-        self.assertIn("keep_alive", body)
+    # keep_alive "auto" (the default): every call re-arms the host's residency timer for the model, so the
+    # client must CONFORM to what is loaded, not impose a value. Send int -1 only when the loaded model's
+    # expires_at is already the Forever sentinel (year > 2100); otherwise send NO field. Always sending -1
+    # turned any short-lived load into a permanent pin; never sending it ended a Forever pin for every caller.
+    def _capture_with_ps(self, ps):
+        sent = []
+        self._install({**HEALTHY, "/api/ps": ps,
+                       "/api/chat": _chat_response(json.dumps({"ok": True}))}, record=sent)
+        self.mod.call_ollama("go", schema=SCHEMA)
+        return [b for b in sent if "messages" in b][-1]
+
+    def test_keep_alive_auto_reasserts_a_forever_pin(self):
+        body = self._capture_with_ps({"models": [{"name": "qwen3:8b", "context_length": 8192,
+                                                  "expires_at": "2319-01-18T22:22:11.2222337Z"}]})
+        self.assertEqual(body.get("keep_alive"), -1)
+        self.assertIsInstance(body.get("keep_alive"), int, "the Forever sentinel is the INTEGER -1; the string is a 400")
+
+    def test_keep_alive_auto_sends_no_field_for_a_finite_ttl(self):
+        body = self._capture_with_ps({"models": [{"name": "qwen3:8b", "context_length": 8192,
+                                                  "expires_at": "2026-10-09T12:05:00Z"}]})
+        self.assertNotIn("keep_alive", body)
+
+    def test_keep_alive_auto_sends_no_field_when_the_model_is_not_loaded(self):
+        body = self._capture_with_ps({"models": []})
+        self.assertNotIn("keep_alive", body, "a client that loads a model must not pin it")
+
+    def test_a_probe_miss_keeps_a_confirmed_forever_pin(self):
+        """one failed /api/ps probe used to omit the field, ending the pin for good."""
+        forever = {"models": [{"name": "qwen3:8b", "context_length": 8192, "expires_at": "2319-01-18T22:22:11Z"}]}
+        self.assertEqual(self._capture_with_ps(forever).get("keep_alive"), -1)
+        body = self._capture_with_ps(urllib.error.URLError("timed out"))
+        self.assertEqual(body.get("keep_alive"), -1, "the last confirmed Forever decision is re-asserted")
+
+    def test_a_probe_miss_with_no_record_sends_no_field(self):
+        body = self._capture_with_ps(urllib.error.URLError("timed out"))
+        self.assertNotIn("keep_alive", body)
+
+    def test_an_untagged_model_name_matches_its_latest_tag(self):
+        """Ollama resolves "qwen3" to "qwen3:latest"; exact matching dropped the pin."""
+        os.environ["OLLAMA_OFFLOAD_MODEL"] = "qwen3"
+        body = self._capture_with_ps({"models": [{"name": "qwen3:latest", "context_length": 8192,
+                                                  "expires_at": "2319-01-18T22:22:11Z"}]})
+        self.assertEqual(body.get("model"), "qwen3")
+        self.assertEqual(body.get("keep_alive"), -1)
+
+    def test_a_corrupt_memo_is_repaired_on_the_next_successful_probe(self):
+        """the write path read the corrupt memo, threw, and skipped the write, so the file stayed bad
+        and a later probe miss lost the Forever pin. A successful probe now rewrites it from scratch."""
+        memo = self.mod._keepalive_memo_path(self.mod._api_base())
+        for bad in ("{bad json", ""):
+            memo.write_text(bad, encoding="utf-8")
+            forever = {"models": [{"name": "qwen3:8b", "context_length": 8192, "expires_at": "2319-01-18T22:22:11Z"}]}
+            self.assertEqual(self._capture_with_ps(forever).get("keep_alive"), -1)
+            self.assertEqual(json.loads(memo.read_text(encoding="utf-8")), {"qwen3:8b": True}, repr(bad))
+            body = self._capture_with_ps(urllib.error.URLError("timed out"))
+            self.assertEqual(body.get("keep_alive"), -1, "the repaired memo carries the pin through a miss")
+
+    def test_the_context_probe_matches_an_untagged_name(self):
+        """the strict context probe matched /api/ps names exactly, so "qwen3" missed "qwen3:latest"
+        and the /api/show Modelfile value was sent instead of the RUNTIME window."""
+        os.environ["OLLAMA_OFFLOAD_MODEL"] = "qwen3"
+        body = self._capture_with_ps({"models": [{"name": "qwen3:latest", "context_length": 12345,
+                                                  "expires_at": "2026-10-09T12:05:00Z"}]})
+        self.assertEqual(body["options"]["num_ctx"], 12345)
+
+    def test_explicit_keep_alive_is_honoured(self):
+        os.environ["OLLAMA_OFFLOAD_KEEP_ALIVE"] = "30m"
+        import ollama_offload
+        self.mod = importlib.reload(ollama_offload)
+        body = self._capture_with_ps({"models": [{"name": "qwen3:8b", "context_length": 8192,
+                                                  "expires_at": "2319-01-18T22:22:11Z"}]})
+        self.assertEqual(body.get("keep_alive"), "30m")
 
     def test_schema_is_sent_as_format(self):
         """Structured output rides on /api/chat's documented `format` field."""
@@ -1091,3 +1170,150 @@ class TestEnvironmentNamespace(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPublicStatus(OllamaOffloadTestCase):
+    """status() / clear_cooldown(): the public read of what the module will do, so consumers stop reaching into
+    private names (_DEFAULT_MODEL_SOURCE, _probe_context_tokens_strict, _in_cooldown_for, cooldown paths)."""
+
+    def _reload_with(self, routes):
+        saved = urllib.request.urlopen
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", saved))
+        urllib.request.urlopen = _routed_urlopen(routes)
+        import ollama_offload
+        self.mod = importlib.reload(ollama_offload)
+
+    def test_status_reports_the_discovered_model_and_a_confirmed_window(self):
+        self._reload_with(HEALTHY)
+        st = self.mod.status()
+        self.assertEqual(st["model"], "qwen3:8b")
+        # The shipped config pins qwen3:8b, and a pin outranks /api/ps on the wire: status() reports the wire.
+        self.assertEqual(st["model_source"], "cfg")
+        self.assertEqual(st["context_tokens"], 8192, "the num_ctx a call would send")
+        self.assertTrue(st["context_confirmed"])
+        self.assertEqual(st["cooldown_s"], 0)
+        self.assertEqual(st["host"], self.mod.active_host_name())
+        self.assertTrue(st["base_url"].startswith("http://"))
+
+    def test_status_says_unconfirmed_when_no_window_can_be_read(self):
+        self._reload_with({**HEALTHY, "/api/ps": {"models": [{"name": "qwen3:8b"}]},
+                           "/api/show": urllib.error.URLError("busy")})
+        st = self.mod.status()
+        self.assertFalse(st["context_confirmed"], "the fallback window is not a reading")
+
+    def test_cooldown_is_reported_and_cleared(self):
+        self._reload_with(HEALTHY)
+        self.mod._set_cooldown_for(self.mod.active_host_name(), "test")
+        self.assertGreater(self.mod.status()["cooldown_s"], 0)
+        removed = self.mod.clear_cooldown()
+        self.assertTrue(removed, "names the sidecar(s) it removed")
+        self.assertEqual(self.mod.status()["cooldown_s"], 0)
+
+
+class TestBudgetRefusal(OllamaOffloadTestCase):
+    """call_ollama(input_ratio=r): refuse a prompt larger than r x the num_ctx the call would send, BEFORE
+    sending it. Never cut. Reachability and cooldown are checked first, so a down host is Unavailable, never
+    'too large' (a consumer that budgets against a fallback window otherwise misreads an outage)."""
+
+    def _routes(self, **over):
+        sent = []
+        self._install({**HEALTHY, "/api/chat": _chat_response(json.dumps({"ok": True})), **over}, record=sent)
+        return sent
+
+    def test_within_budget_is_sent_whole(self):
+        sent = self._routes()
+        prompt = "a" * 1000  # 8192 x 0.4 x 4 = 13107
+        self.mod.call_ollama(prompt, schema=SCHEMA, input_ratio=0.4)
+        self.assertEqual([b for b in sent if "messages" in b][-1]["messages"][-1]["content"], prompt)
+
+    def test_over_budget_is_refused_with_its_sizes_and_nothing_is_sent(self):
+        sent = self._routes()
+        with self.assertRaises(self.mod.OllamaPromptTooLarge) as ctx:
+            self.mod.call_ollama("b" * 20000, schema=SCHEMA, input_ratio=0.4)
+        e = ctx.exception
+        self.assertIsInstance(e, self.mod.OllamaCallError)
+        self.assertNotIsInstance(e, self.mod.OllamaUnavailable)
+        self.assertEqual((e.chars, e.budget, e.context_tokens, e.ratio), (20000, 13107, 8192, 0.4))
+        self.assertEqual([b for b in sent if "messages" in b], [], "never cut, never sent")
+        in_cd, _ = self.mod._in_cooldown_for(self.mod.active_host_name())
+        self.assertFalse(in_cd, "a too-large prompt is not a host fault")
+
+    def test_system_prompt_counts_toward_the_budget(self):
+        self._routes()
+        with self.assertRaises(self.mod.OllamaPromptTooLarge):
+            self.mod.call_ollama("c" * 10000, system="s" * 4000, input_ratio=0.4)
+
+    def test_a_down_host_is_unavailable_not_too_large(self):
+        self.mod._BASE_BACKOFF_S = 0
+        self._routes(**{"/api/version": urllib.error.URLError("connection refused")})
+        with self.assertRaises(self.mod.OllamaUnavailable):
+            self.mod.call_ollama("d" * 20000, schema=SCHEMA, input_ratio=0.4)
+
+    def test_no_ratio_means_no_check(self):
+        sent = self._routes()
+        self.mod.call_ollama("e" * 20000, schema=SCHEMA)
+        self.assertTrue([b for b in sent if "messages" in b])
+
+
+class TestDeadHostAtImport(OllamaOffloadTestCase):
+    """A host that is down when the module is imported leaves discovery on the hint. A call must then
+    BENCH it (arm the cooldown), as any transport failure does, and later calls must short-circuit on that
+    cooldown before probing the host again."""
+
+    def _reload_dead(self):
+        saved = urllib.request.urlopen
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", saved))
+        dead = urllib.error.URLError("connection refused")
+        calls = []  # EVERY url opened (the shared helper records only POST bodies, so it cannot see GET probes)
+        inner = _routed_urlopen({"/api/version": dead, "/api/ps": dead, "/api/tags": dead,
+                                 "/api/show": dead, "/api/chat": dead})
+
+        def counting(req, timeout=None):
+            calls.append(req.full_url if hasattr(req, "full_url") else str(req))
+            return inner(req, timeout)
+        urllib.request.urlopen = counting
+        os.environ.pop("OLLAMA_OFFLOAD_MODEL", None)
+        import ollama_offload
+        self.mod = importlib.reload(ollama_offload)
+        self.mod._BASE_BACKOFF_S = 0
+        # No model pin, so discovery is what fails: the import-time state of a pin-less config with a dead host.
+        self.mod._CFG.pop("model", None)
+        self.mod._ACTIVE_HOST["model"] = None
+        self.mod._DEFAULT_MODEL_SOURCE = "hint"
+        return calls
+
+    def test_a_dead_host_is_unavailable_and_benched(self):
+        self._reload_dead()
+        with self.assertRaises(self.mod.OllamaUnavailable):
+            self.mod.call_ollama("go", schema=SCHEMA)
+        in_cd, _ = self.mod._in_cooldown_for(self.mod.active_host_name())
+        self.assertTrue(in_cd, "a host that does not answer is benched")
+
+    def test_a_benched_host_is_not_probed_again(self):
+        calls = self._reload_dead()
+        self.mod._set_cooldown_for(self.mod.active_host_name(), "test")
+        n = len(calls)
+        with self.assertRaises(self.mod.OllamaUnavailable):
+            self.mod.call_ollama("go", schema=SCHEMA)
+        self.assertEqual(len(calls), n, "the cooldown short-circuits before any discovery probe")
+
+
+class TestStatusHasNoSideEffects(OllamaOffloadTestCase):
+    """status() on the hint path re-discovered and left _DEFAULT_MODEL_SOURCE = "ps" while
+    DEFAULT_MODEL stayed the hint, so the NEXT call skipped its recovery and sent the hardcoded hint to the host."""
+
+    def test_status_then_call_sends_what_status_reported(self):
+        sent = []
+        self._install({**HEALTHY, "/api/ps": {"models": [{"name": "a:1b", "context_length": 4096}]},
+                       "/api/tags": {"models": [{"name": "a:1b"}]},
+                       "/api/chat": _chat_response(json.dumps({"ok": True}))}, record=sent)
+        # The import-time state of a pin-less config whose host was down at import, now back.
+        self.mod._CFG.pop("model", None)
+        self.mod._ACTIVE_HOST["model"] = None
+        self.mod.DEFAULT_MODEL = self.mod._DEFAULT_MODEL_HINT
+        self.mod._DEFAULT_MODEL_SOURCE = "hint"
+        st = self.mod.status()
+        self.assertEqual(st["model"], "a:1b")
+        self.assertEqual(self.mod._DEFAULT_MODEL_SOURCE, "hint", "status() must not change module state")
+        self.mod.call_ollama("go", schema=SCHEMA)
+        self.assertEqual([b for b in sent if "messages" in b][-1]["model"], st["model"], "the wire carries what status() reported")

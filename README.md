@@ -50,9 +50,19 @@ unparseable content`.
 - **Runtime context discovery** — reads the model's real context window and sizes input against
   a per-consumer ratio of it. The architectural maximum from `/api/show` is often far larger
   than what is actually loaded under VRAM pressure, so using it over-fills prompts.
-- **Explicit `keep_alive`** — Ollama defaults to unloading after `5m`. On a large model that
-  means the next call pays a full reload, which reads as "the model got slow" rather than "the
-  model was evicted". This client always sends the field.
+- **`keep_alive` that follows the server instead of overriding it** — Ollama decides how long
+  a model stays loaded from the `keep_alive` value on each request, for every client of that
+  server. Leaving the value out does not mean "leave it as it is": the server applies its own
+  short default. So by default (`"auto"`) this client first asks the server what is loaded
+  (`/api/ps`). If the model is already set to stay loaded indefinitely, it sends `-1` (as a
+  number; the text `"-1"` is rejected) to keep it that way. Otherwise it sends nothing. A model
+  name without a tag matches the same name with `:latest`. If the server cannot be asked, the
+  client reuses its last answer for that server and model, kept in a small file in the temp
+  folder and shared by the Python and PowerShell versions, so one slow request does not unload
+  a model that was meant to stay. Earlier versions always sent `-1`, which kept every model they
+  touched loaded indefinitely on a shared GPU. A value you set yourself (`-1`, a number of
+  seconds, or a duration such as `"30m"`, in the config, an environment variable or the call) is
+  always sent as given, and `null` sends nothing.
 - **`think: false` by default** — a reasoning model asked for structured extraction spends time
   thinking to no benefit, and can stall for the whole timeout. Measured here: 1.5s with the
   field set versus a hang past 180s without it. Override per call.
@@ -172,6 +182,11 @@ tier that produces a non-empty value wins; the rest are skipped.
    guard in `_call_ollama_once` raises `OllamaUnavailable` rather than send a hint to a host
    that answered a probe with no models.
 
+Both versions now follow this order in the same way. Before October 2026, the PowerShell version
+skipped step 3 (a model named in the config) for the default host and used the discovered model
+instead. If you use the PowerShell version and your config names a `model`, it now uses that
+model, as the Python version always has.
+
 ### Recovery after a bootstrap-time miss (F5)
 
 If the primary host was down at import (tier 6 fired and `_DEFAULT_MODEL_SOURCE == "hint"`), a
@@ -189,10 +204,54 @@ at import; `_call_ollama_once` threads the resolved per-call `base_url` through 
 call so that the wire body's `model` and `options.num_ctx` describe the *actual* target host,
 even under `-HostName` override or failover.
 
+## Budget refusal
+
+Pass a share of the context window and the call refuses, before sending, a prompt that will not fit:
+
+```python
+oo.call_ollama(prompt, schema=schema, input_ratio=0.4)   # raises OllamaPromptTooLarge if too big
+```
+```powershell
+Invoke-OllamaCall -TaskPrompt $prompt -Schema $schema -InputRatio 0.4
+```
+
+The limit is `input_ratio` x the context window this call will use (Ollama's `num_ctx`, in tokens)
+x 4 characters per token. The system prompt counts towards it. Nothing is ever cut short: a
+silently shortened prompt loses its end, often the instructions, and the model still answers.
+You decide what is safe to trim. The client first checks that the server is reachable and not
+in a cooldown, so a server that is down raises `OllamaUnavailable`, never "too large". The
+error carries `chars`, `budget`, `ratio`, `context_tokens` and `context_confirmed` (PowerShell:
+`Chars`, `Budget`, `Ratio`, `ContextTokens`, `ContextConfirmed`).
+
+## Status
+
+Ask the module what it will do, instead of reading its internals:
+
+```python
+oo.status()
+# {'host': 'primary', 'base_url': 'http://localhost:11434', 'model': 'qwen3:8b', 'model_source': 'ps',
+#  'context_tokens': 8192, 'context_confirmed': True, 'cooldown_s': 0}
+oo.clear_cooldown()   # -> the paths of the cooldown files it removed
+```
+```powershell
+Get-OllamaStatus      # same keys
+Clear-OllamaCooldown
+```
+
+`model` and `context_tokens` are what the next call to the default host would send, following the
+same order as a real call (see [Model resolution](#model-resolution)). Asking for the status changes
+nothing. `context_confirmed` is true only when the server, asked again, reports that same context
+window; false means the number is the configured fallback (or the server has changed), so size
+your input conservatively. `model_source` says where the model came from: `env`
+(`OLLAMA_OFFLOAD_MODEL`), `cfg` (named in the config), `ps` (loaded on the server), `tags`
+(installed but not loaded) or `hint` (nothing could be discovered, so the built-in fallback name).
+
 ## Errors
 
 ```
 OllamaCallError          base for call-time failures (schema-invalid content, model faults)
+├── OllamaPromptTooLarge the prompt is over input_ratio x the window this call would send;
+│                        raised before sending, nothing cut, no cooldown, no failover
 └── OllamaUnavailable    the host could not be reached, is in cooldown, or discovery
                          cannot find a real model on a reachable host — the failover
                          orchestrator catches THIS class only

@@ -33,8 +33,8 @@
   "_doc_think": "Ollama's top-level /api/chat `think` field. Reasoning models default to thinking ON, which for a structured-JSON extraction contract adds latency without improving the result and can stall a call for the full timeout. Measured against a reasoning model: think=false returned in 1.5s where omitting the field hung past 180s. Per-call `think=` overrides this; so does OLLAMA_OFFLOAD_THINK.",
   "think": false,
 
-  "_doc_keep_alive": "Seconds to keep the model resident, or -1 to pin it indefinitely. Set explicitly rather than left to the server default, so a cold reload never lands in the middle of a batch.",
-  "keep_alive": -1,
+  "_doc_keep_alive": "\"auto\" (the default when this key is absent): conform to the loaded model. Every call re-arms the host's residency timer for the model it names, and an omitted field is not neutral. So send int -1 only when /api/ps shows the model already pinned Forever (expires_at year > 2100), and send no field otherwise; a client that sends -1 by default turns any short-lived load into a permanent pin on a shared GPU. An explicit value (int seconds, -1, or a duration string like \"30m\") is sent as given; null sends no field.",
+  "keep_alive": "auto",
 
   "_doc_consumers": "Each key below is a CONSUMER: a named caller with its own share of the context window. Pass its name as consumer= / -Consumer and the client sizes input against that ratio. Splitting callers this way keeps a chatty consumer from crowding out a careful one, and makes the per-caller budget reviewable in one file. Add your own; these two are examples.",
 

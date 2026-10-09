@@ -62,6 +62,17 @@ class OllamaCallError : System.Exception {
 class OllamaUnavailable : OllamaCallError {
     OllamaUnavailable([string]$Msg) : base($Msg) {}
 }
+# Twin of Python OllamaPromptTooLarge: the prompt (plus system) exceeds -InputRatio x the num_ctx this call
+# would send. Raised BEFORE sending; nothing is cut or sent; no cooldown (the host is fine).
+class OllamaPromptTooLarge : OllamaCallError {
+    [int]$Chars; [int]$Budget; [double]$Ratio; [int]$ContextTokens; [bool]$ContextConfirmed
+    OllamaPromptTooLarge([int]$Chars, [int]$Budget, [double]$Ratio, [int]$ContextTokens, [bool]$ContextConfirmed) : base(
+        "prompt too large: $Chars chars > budget $Budget (ratio $Ratio of a $ContextTokens-token window" +
+        $(if ($ContextConfirmed) { '' } else { ', the FALLBACK window: no live reading' }) + '); nothing was sent or cut') {
+        $this.Chars = $Chars; $this.Budget = $Budget; $this.Ratio = $Ratio
+        $this.ContextTokens = $ContextTokens; $this.ContextConfirmed = $ContextConfirmed
+    }
+}
 # Startup-time config error — distinct from OllamaCallError so callers can
 # differentiate a misconfiguration (fix env / config) from a call failure
 # (retry / cooldown). Raised only when OLLAMA_OFFLOAD_HOST is EXPLICITLY set to a
@@ -183,7 +194,8 @@ function _ResolveActiveHost {
     $rawUrlEnv = _EnvOr 'OLLAMA_OFFLOAD_URL'   $null
     if (-not $rawUrlEnv) { $rawUrlEnv = _EnvOr 'OLLAMA_OFFLOAD_URL' $null }
     if ($rawUrlEnv) {
-        $Script:ActiveHost = @{ Name = '<env-url>'; Url = $rawUrlEnv }
+        # Python parity: the raw-URL host still carries the config's top-level model pin.
+        $Script:ActiveHost = @{ Name = '<env-url>'; Url = $rawUrlEnv; Model = (Get-OllamaConfig)['model'] }
         return $Script:ActiveHost
     }
 
@@ -206,7 +218,8 @@ function _ResolveActiveHost {
     }
     if (-not $hostEntry) { $hostEntry = @{} }
     $configUrl = $hostEntry['url'] ?? $cfg['url'] ?? 'http://localhost:11434/api/chat'
-    $Script:ActiveHost = @{ Name = $hostName; Url = $configUrl }
+    # Python parity (_resolve_active_host): the entry's model pin, else the top-level one.
+    $Script:ActiveHost = @{ Name = $hostName; Url = $configUrl; Model = ($hostEntry['model'] ?? $cfg['model']) }
     return $Script:ActiveHost
 }
 
@@ -492,7 +505,11 @@ function _ProbeContextTokensForHostStrict {
         $ps = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/ps" -TimeoutSec 5
         if ($null -ne $ps -and $ps.PSObject.Properties.Name -contains 'models') {
             foreach ($m in $ps.models) {
-                if (($m.name -eq $Model -or $m.model -eq $Model) -and
+                $mk = _ModelKey $Model
+                $names = @()
+                if ($m.PSObject.Properties.Name -contains 'name')  { $names += (_ModelKey $m.name) }
+                if ($m.PSObject.Properties.Name -contains 'model') { $names += (_ModelKey $m.model) }
+                if (($names -contains $mk) -and
                     $m.PSObject.Properties.Name -contains 'context_length') {
                     return [int]$m.context_length
                 }
@@ -638,6 +655,82 @@ function _SetCooldownFor {
 }
 
 # ---- P3 + P4 — the ONE call surface ---------------------------------------
+function _HostPin {
+    # A host entry's model pin, StrictMode-safe: host objects may be hashtables or objects with or without a
+    # Model property (tests mock both), and reading a missing property throws under StrictMode.
+    param($HostEntry)
+    if ($null -eq $HostEntry) { return $null }
+    if ($HostEntry -is [System.Collections.IDictionary]) { return $HostEntry['Model'] }
+    if ($HostEntry.PSObject.Properties.Name -contains 'Model') { return $HostEntry.Model }
+    return $null
+}
+
+function _ModelKey {
+    # Twin of Python _model_key: Ollama resolves an untagged name to ':latest' server-side.
+    param([string]$Name)
+    $n = "$Name".Trim()
+    $last = ($n -split '/')[-1]
+    if ($last -like '*:*') { return $n } else { return "$n`:latest" }
+}
+
+function _KeepAliveMemoPath {
+    # Twin of Python _keepalive_memo_path: the SAME file, so both twins share the last confirmed decision.
+    param([string]$BaseUrl)
+    return (Join-Path $env:TEMP "ollama_offload_keepalive.$(_SanitizeHostForPath -Name $BaseUrl).json")
+}
+
+function _PolicyKeepAlive {
+    # Twin of Python _policy_keep_alive. [long]-1 when /api/ps lists the model with a Forever expires_at
+    # (year > 2100); $null (no field) for a finite TTL or not loaded. When /api/ps cannot be read, reuse the
+    # last CONFIRMED decision from the shared memo (omitting on a probe error would end a Forever pin for good).
+    param([string]$Model, [string]$BaseUrl)
+    $key = _ModelKey $Model
+    $memo = _KeepAliveMemoPath -BaseUrl $BaseUrl
+    try { $ps = Invoke-RestMethod -Method Get -Uri ($BaseUrl + '/api/ps') -TimeoutSec 5 }
+    catch {
+        try {
+            $seen = Get-Content -Raw -Path $memo -ErrorAction Stop | ConvertFrom-Json -AsHashtable
+            if ($seen.ContainsKey($key) -and $seen[$key] -eq $true) { return [long]-1 }
+        } catch {}
+        return $null
+    }
+    $forever = $false
+    if ($null -ne $ps -and $ps.PSObject.Properties.Name -contains 'models') {
+        foreach ($m in @($ps.models)) {
+            $names = @()
+            if ($m.PSObject.Properties.Name -contains 'name')  { $names += (_ModelKey $m.name) }
+            if ($m.PSObject.Properties.Name -contains 'model') { $names += (_ModelKey $m.model) }
+            if ($names -notcontains $key) { continue }
+            if ($m.PSObject.Properties.Name -contains 'expires_at' -and $null -ne $m.expires_at) {
+                # Invoke-RestMethod / ConvertFrom-Json turn the ISO string into a [DateTime]; its text form is
+                # culture-formatted, so read .Year. A raw string (other deserializers) is parsed from its start.
+                if ($m.expires_at -is [datetime]) { $forever = $m.expires_at.Year -gt 2100 }
+                else {
+                    $exp = "$($m.expires_at)"; $year = 0
+                    $forever = ($exp.Length -ge 4 -and [int]::TryParse($exp.Substring(0, 4), [ref]$year) -and $year -gt 2100)
+                }
+            }
+            break
+        }
+    }
+    # Missing, empty or corrupt memo: start over (skipping the write left it bad for good).
+    $seen = $null
+    try { $seen = Get-Content -Raw -Path $memo -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch {}
+    if ($seen -isnot [System.Collections.IDictionary]) { $seen = @{} }
+    $seen[$key] = $forever
+    try {
+        # Atomic: sibling temp file, then replace (twin of Python os.replace), so no reader sees a torn file.
+        $tmp = "$memo.$PID.tmp"
+        Set-Content -Path $tmp -Value ($seen | ConvertTo-Json -Compress) -Encoding utf8 -ErrorAction Stop
+        Move-Item -Path $tmp -Destination $memo -Force -ErrorAction Stop
+    } catch {
+        # Not fatal (the memo is a hint), but never leave the temp file behind.
+        Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if ($forever) { return [long]-1 }
+    return $null
+}
+
 function _InvokeOllamaCallOnce {
     <#
     .SYNOPSIS
@@ -680,6 +773,8 @@ function _InvokeOllamaCallOnce {
         $KeepAlive = $null,
         [switch]$Logprobs,
         [int]$TopLogprobs = 5,
+        [double]$InputRatio = 0,
+        [int]$CharsPerToken = 4,
         # per-call host override. When set, this call
         # resolves the named host via _ResolveHostByName + uses THAT host's
         # url/model for THIS invocation only — bypasses the module-cached
@@ -726,8 +821,14 @@ function _InvokeOllamaCallOnce {
     # c0961a3 (i/v): strip on read; empty-after-strip = UNSET so the ladder falls through.
     $envModelOverride = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
     if ($envModelOverride) { $envModelOverride = $envModelOverride.Trim() }
-    $keepAlive = '5m'
     $activeHost = _ResolveActiveHost
+    # Cooldown FIRST, before any discovery probe (twin of Python): a benched host is not probed again, since
+    # each probe to a dead host costs its timeout. The later check below stays for the resolved host.
+    $preHost = if ($HostName) { _ResolveHostByName -Name $HostName } else { $activeHost }
+    $preCooldown = _CooldownRemainingFor -HostName $preHost.Name
+    if ($preCooldown -gt 0) {
+        throw [OllamaUnavailable]::new("Ollama host=$($preHost.Name) in cooldown for ${preCooldown}s more (per-host sidecar: $(_CooldownPathFor -HostName $preHost.Name))")
+    }
     if ($HostName) {
         # Per-call host override — skip module `_Discover` (that would probe
         # the WRONG host + block a valid failover on OllamaUnavailable).
@@ -752,6 +853,13 @@ function _InvokeOllamaCallOnce {
             # the reachable secondary could not answer — raise OllamaUnavailable
             # so the failover orchestrator walks to the next host.
             if ($Script:DefaultModelSource -eq 'hint') {
+                # Discovery failed because the host does not answer at all: bench it, as a transport failure
+                # would, so later calls short-circuit on the cooldown (twin of Python).
+                try { Invoke-RestMethod -Method Get -Uri ($callBase + '/api/version') -TimeoutSec 4 | Out-Null }
+                catch {
+                    _SetCooldownFor -HostName $callHost.Name -Seconds ([int](_EnvOr 'OLLAMA_OFFLOAD_COOLDOWN_S' ((Get-OllamaConfig)['cooldown_on_fail_s'] ?? 300)))
+                    throw [OllamaUnavailable]::new("Ollama unreachable at $callBase (model discovery); per-host cooldown engaged")
+                }
                 throw [OllamaUnavailable]::new(
                     "model discovery fell back to `$Script:DefaultModelHint for host=$($callHost.Name) at $callBase. " +
                     "Set OLLAMA_OFFLOAD_MODEL, add ``model`` to the host entry, or ensure /api/ps + /api/tags " +
@@ -774,6 +882,10 @@ function _InvokeOllamaCallOnce {
             $effectiveModel = $Model
         } elseif ($envModelOverride) {
             $effectiveModel = $envModelOverride
+        } elseif (_HostPin $callHost) {
+            # Python parity: a per-host config pin outranks discovery on the ACTIVE host too.
+            # This twin skipped it here, so the same config sent a different model per language.
+            $effectiveModel = _HostPin $callHost
         } elseif ($Script:DefaultModelSource -eq 'hint') {
             # F5: active-host import-time discovery fell back to the
             # hardcoded hint. Retry against the resolved base before shipping
@@ -788,6 +900,13 @@ function _InvokeOllamaCallOnce {
                 # the chain. A hint-fallback on the primary must let the
                 # failover chain be walked, not bubble as an unrecoverable
                 # call error. Python parity: raise OllamaUnavailable.
+                # Discovery failed because the host does not answer at all: bench it, as a transport failure
+                # would, so later calls short-circuit on the cooldown (twin of Python).
+                try { Invoke-RestMethod -Method Get -Uri ($callBase + '/api/version') -TimeoutSec 4 | Out-Null }
+                catch {
+                    _SetCooldownFor -HostName $callHost.Name -Seconds ([int](_EnvOr 'OLLAMA_OFFLOAD_COOLDOWN_S' ((Get-OllamaConfig)['cooldown_on_fail_s'] ?? 300)))
+                    throw [OllamaUnavailable]::new("Ollama unreachable at $callBase (model discovery); per-host cooldown engaged")
+                }
                 throw [OllamaUnavailable]::new(
                     "model discovery fell back to `$Script:DefaultModelHint for host=$($callHost.Name) at $callBase. " +
                     "Set OLLAMA_OFFLOAD_MODEL, add ``model`` to the host entry, or ensure /api/ps + /api/tags " +
@@ -875,7 +994,6 @@ function _InvokeOllamaCallOnce {
         } else {
             $effectiveContextTokens = _DiscoverContextTokensForHost -Model $effectiveModel -BaseUrl $callBase
         }
-        $keepAlive = $d.KeepAlive
     }
 
     # per-host cooldown check keyed on the RESOLVED
@@ -890,6 +1008,24 @@ function _InvokeOllamaCallOnce {
             "(per-host sidecar: $(_CooldownPathFor -HostName $callHost.Name); " +
             "legacy global: $($Script:CooldownPath))"
         )
+    }
+
+    # Budget refusal (twin of Python input_ratio), after the cooldown check above. This twin has no
+    # always-on reachability pre-flight, so before calling a prompt "too large" it checks /api/version: a
+    # down host is OllamaUnavailable (cooldown armed, as a transport failure would), never "too large".
+    if ($InputRatio -gt 0) {
+        $budget = [int][Math]::Floor($effectiveContextTokens * $InputRatio * $CharsPerToken)
+        $chars = $TaskPrompt.Length + $(if ($System) { $System.Length } else { 0 })
+        if ($chars -gt $budget) {
+            try { Invoke-RestMethod -Method Get -Uri ($callBase + '/api/version') -TimeoutSec 4 | Out-Null }
+            catch {
+                _SetCooldownFor -HostName $callHost.Name -Seconds $cooldownOnFail
+                throw [OllamaUnavailable]::new("Ollama unreachable at $callBase; per-host cooldown engaged")
+            }
+            $strict = _ProbeContextTokensForHostStrict -Model $effectiveModel -BaseUrl $callBase
+            throw [OllamaPromptTooLarge]::new($chars, $budget, $InputRatio, [int]$effectiveContextTokens,
+                ($null -ne $strict -and [int]$strict -eq [int]$effectiveContextTokens))
+        }
     }
 
     $messages = @()
@@ -910,15 +1046,28 @@ function _InvokeOllamaCallOnce {
     #   OLLAMA_OFFLOAD_KEEP_ALIVE -> config.keep_alive -> -1 (resident)
     # NOT the '5m' reported by /api/show: that is the model's advertised default, not an
     # instruction to the client, and treating it as one is how the eviction happens.
+    # Python parity (_resolve_default_keep_alive): env -> config (an explicit null sends NO field) ->
+    # "auto" when the key is absent. Before this, a config null fell through to -1 here while Python omitted.
     $effectiveKeepAlive = _EnvOr 'OLLAMA_OFFLOAD_KEEP_ALIVE' $null
+    # Python parity: an env value that parses as an integer is sent AS one. The string "-1" is a 400 (Go
+    # time.Duration needs a unit), and a 400 here is retried and benches the host.
+    if ($effectiveKeepAlive -is [string]) { $kaInt = 0L; if ([long]::TryParse($effectiveKeepAlive.Trim(), [ref]$kaInt)) { $effectiveKeepAlive = $kaInt } }
     if ($null -eq $effectiveKeepAlive -or $effectiveKeepAlive -eq '') {
         $cfgKA = (Get-OllamaConfig)
-        $effectiveKeepAlive = if ($null -ne $cfgKA -and $null -ne $cfgKA.keep_alive) { $cfgKA.keep_alive } else { -1 }
+        $effectiveKeepAlive = if ($cfgKA -is [System.Collections.IDictionary] -and $cfgKA.Contains('keep_alive')) { $cfgKA['keep_alive'] } else { 'auto' }
     }
     # Parity: per-call -Model and -KeepAlive now override the resolved defaults,
-    # matching Python's model= / keep_alive= kwargs.
+    # matching Python's model= / keep_alive= kwargs. (PowerShell names are case-insensitive: a local
+    # `$keepAlive = '5m'` here, and `$keepAlive = $d.KeepAlive` from /api/show, used to OVERWRITE the -KeepAlive
+    # parameter, so every call sent '5m' -- the eviction this block exists to prevent. Both are gone.)
     if ($Model) { $effectiveModel = $Model }
     if ($null -ne $KeepAlive -and $KeepAlive -ne '') { $effectiveKeepAlive = $KeepAlive }
+    # "auto": conform to the loaded model (twin of Python _policy_keep_alive). Send int -1 only when /api/ps
+    # shows this model already pinned Forever (expires_at year > 2100); otherwise send NO field. Every call
+    # re-arms the host's residency timer, so always sending -1 turned any short load into a permanent pin.
+    if ($effectiveKeepAlive -is [string] -and $effectiveKeepAlive.Trim().ToLowerInvariant() -eq 'auto') {
+        $effectiveKeepAlive = _PolicyKeepAlive -Model $effectiveModel -BaseUrl $callBase
+    }
 
     if ($TimeoutSec -gt 0) { $callTimeout = $TimeoutSec }   # per-call override (Python timeout_s)
 
@@ -926,7 +1075,6 @@ function _InvokeOllamaCallOnce {
         model      = $effectiveModel
         messages   = $messages
         stream     = $false
-        keep_alive = $effectiveKeepAlive
         options    = @{
             num_ctx     = $effectiveContextTokens
             temperature = $effectiveTemperature
@@ -952,6 +1100,7 @@ function _InvokeOllamaCallOnce {
     # Both twins report elapsed_s, eval_tokens and prompt_tokens in _meta. The token
     # counts come off the same response object the call already receives, so there is no
     # extra request; the elapsed time is a stopwatch around the retry loop.
+    if ($null -ne $effectiveKeepAlive -and "$effectiveKeepAlive" -ne '') { $body['keep_alive'] = $effectiveKeepAlive }
     $callSw = [System.Diagnostics.Stopwatch]::StartNew()
     for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
         try {
@@ -962,7 +1111,18 @@ function _InvokeOllamaCallOnce {
             $content = $resp.message.content
             if ($Schema) {
                 try {
-                    $parsed = ($content | ConvertFrom-Json -AsHashtable)
+                    $parsed = ($content | ConvertFrom-Json -AsHashtable -NoEnumerate)   # -NoEnumerate: '[{...}]' must stay an array
+                    # Python parity: a schema call promises a JSON OBJECT carrying the schema's required
+                    # top-level keys. This twin never checked the keys (a reply missing them was returned as
+                    # a success), and a non-object reply only failed by accident, on the _meta assignment.
+                    # Both are model faults: they throw here and the catch below raises OllamaCallError.
+                    if ($parsed -isnot [hashtable]) {
+                        throw "content was JSON but not an object ($(if ($null -eq $parsed) { 'null' } else { $parsed.GetType().Name }))"
+                    }
+                    $required = if ($Schema -is [System.Collections.IDictionary] -and $Schema.Contains('required')) { @($Schema['required']) } else { @() }
+                    foreach ($key in $required) {
+                        if (-not $parsed.ContainsKey($key)) { throw "missing required key '$key': keys=$(@($parsed.Keys) -join ',')" }
+                    }
                     # eval_count / prompt_eval_count come straight off $resp. The property
                     # probes are StrictMode-safe on purpose: under Set-StrictMode -Version
                     # Latest, reading a field an older server did not send THROWS, where
@@ -1206,7 +1366,11 @@ function Invoke-OllamaCall {
         $Think = $null,
         $KeepAlive = $null,
         [switch]$Logprobs,
-        [int]$TopLogprobs = 5)
+        [int]$TopLogprobs = 5,
+        # Twin of Python input_ratio: refuse a prompt larger than InputRatio x the num_ctx this call would
+        # send (OllamaPromptTooLarge), after cooldown and reachability. 0 = no check.
+        [double]$InputRatio = 0,
+        [int]$CharsPerToken = 4)
 
     $cfg = Get-OllamaConfig
     if ($null -eq $FailoverHosts) {
@@ -1236,9 +1400,9 @@ function Invoke-OllamaCall {
     if (-not $FailoverHosts -or $FailoverHosts.Count -eq 0) {
         # Single-host behaviour — one host, one try.
         if ($HostName) {
-            return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $HostName -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs
+            return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $HostName -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken
         }
-        return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs
+        return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken
     }
 
     # Failover path — build ordered chain [primary, ...failover] dedup'd.
@@ -1252,7 +1416,7 @@ function Invoke-OllamaCall {
     for ($i = 0; $i -lt $chain.Count; $i++) {
         $h = $chain[$i]
         try {
-            $result = _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $h -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs
+            $result = _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $h -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken
             if ($Schema -and $i -gt 0 -and $result -is [hashtable]) {
                 # Failover fired — record the actual traversal for audit.
                 if (-not $result.ContainsKey('_meta')) { $result['_meta'] = @{} }
@@ -1367,7 +1531,62 @@ function Test-OllamaProbe {
     return [pscustomobject]@{ Ok=$true; Reason="reachable via $(Get-OllamaActiveHost)" }
 }
 
+function Get-OllamaStatus {
+    <#
+    .SYNOPSIS
+      What this module will do on the next call to the ACTIVE host. Twin of Python status(): same keys.
+    .OUTPUTS
+      [pscustomobject] host, base_url, model, model_source (env|ps|tags|cfg|hint), context_tokens (the num_ctx
+      a call would send), context_confirmed ($true only when a fresh strict probe reads a window equal to
+      context_tokens; $false = the configured fallback or a changed host), cooldown_s (0 = callable).
+    .NOTES
+      Read this instead of $Script: internals. Costs one strict context probe.
+    #>
+    [CmdletBinding()] param()
+    $d = _Discover
+    $activeHost = _ResolveActiveHost
+    $hostName = $activeHost.Name
+    # The SAME ladder a call walks with no -Model: env > host pin > (hint: rediscover) > discovered.
+    $envModel = _EnvOr 'OLLAMA_OFFLOAD_MODEL' $null
+    if ($envModel) { $envModel = $envModel.Trim() }
+    if ($envModel) { $model = $envModel; $source = 'env' }
+    elseif (_HostPin $activeHost) { $model = _HostPin $activeHost; $source = 'cfg' }
+    elseif ($Script:DefaultModelSource -eq 'hint') {
+        # Probe WITHOUT side effects: _DiscoverModelForHost writes $Script:DefaultModelSource, and
+        # leaving it 'ps'/'tags' while the cache still holds the hint made the next call skip its startup-miss recovery and send the hint.
+        $savedSource = $Script:DefaultModelSource
+        try { $model = _DiscoverModelForHost -BaseUrl $d.BaseUrl; $source = $Script:DefaultModelSource }
+        finally { $Script:DefaultModelSource = $savedSource }
+    }
+    else { $model = $d.Model; $source = $Script:DefaultModelSource }
+    $sent = if ($model -eq $d.Model) { [int]$d.ContextTokens } else { [int](_DiscoverContextTokensForHost -Model $model -BaseUrl $d.BaseUrl) }
+    $strict = _ProbeContextTokensForHostStrict -Model $model -BaseUrl $d.BaseUrl
+    return [pscustomobject]@{
+        host              = $hostName
+        base_url          = $d.BaseUrl
+        model             = $model
+        model_source      = $source
+        context_tokens    = $sent
+        context_confirmed = ($null -ne $strict -and [int]$strict -eq $sent)
+        cooldown_s        = [int](_CooldownRemainingFor -HostName $hostName)
+    }
+}
+
+function Clear-OllamaCooldown {
+    <#
+    .SYNOPSIS
+      Remove the ACTIVE host's per-host cooldown sidecar and the legacy global one. Twin of Python
+      clear_cooldown(). Returns the paths removed. Both twins read the same files.
+    #>
+    [CmdletBinding()] param()
+    $removed = @()
+    foreach ($path in @((_CooldownPathFor -HostName (Get-OllamaActiveHost)), $Script:CooldownPath)) {
+        if (Test-Path $path) { Remove-Item -Path $path -Force; $removed += $path }
+    }
+    return $removed
+}
+
 Export-ModuleMember -Function `
     Get-OllamaConfig, Get-OllamaConsumerConfig, Get-OllamaContextBytes, `
     Invoke-OllamaCall, Test-OllamaReachable, Get-OllamaActiveHost, `
-    Get-OllamaHealthcheck, Test-OllamaProbe
+    Get-OllamaHealthcheck, Test-OllamaProbe, Get-OllamaStatus, Clear-OllamaCooldown

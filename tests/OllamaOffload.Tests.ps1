@@ -94,10 +94,89 @@ Describe 'OllamaOffload' {
             $body.options.Keys | Should -Contain 'num_ctx'
         }
 
-        It 'sends keep_alive explicitly' {
+        It 'keep_alive auto: does NOT send the field when the model has no Forever pin (twin parity)' {
+            # The shared fixture's /api/ps entry carries no expires_at: not a Forever pin.
             $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
             Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
-            $script:Sent[-1].Keys | Should -Contain 'keep_alive'
+            $script:Sent[-1].Keys | Should -Not -Contain 'keep_alive'
+        }
+    }
+
+    Context 'keep_alive auto conforms to the loaded model' {
+
+        BeforeEach {
+            $script:Sent = [System.Collections.ArrayList]::new()
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:PsNow }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') {
+                    [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable))
+                    return (New-ChatResponse -Content '{"ok":true}')
+                }
+                throw "no fixture for $Uri"
+            }
+            $script:Schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+        }
+
+        It 're-asserts a Forever pin as the INTEGER -1' {
+            $script:PsNow = [pscustomobject]@{ models = @([pscustomobject]@{ name = 'qwen3:8b'; context_length = 8192; expires_at = '2319-01-18T22:22:11.2222337Z' }) }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema | Out-Null
+            $script:Sent[-1]['keep_alive'] | Should -Be -1
+            $script:Sent[-1]['keep_alive'] | Should -BeOfType [long]
+        }
+
+        It 'sends no field for a finite TTL' {
+            $script:PsNow = [pscustomobject]@{ models = @([pscustomobject]@{ name = 'qwen3:8b'; context_length = 8192; expires_at = '2026-10-09T12:05:00Z' }) }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema | Out-Null
+            $script:Sent[-1].Keys | Should -Not -Contain 'keep_alive'
+        }
+
+        It 're-asserts Forever from a DESERIALIZED /api/ps (expires_at arrives as [DateTime])' {
+            # Invoke-RestMethod/ConvertFrom-Json turn an ISO string into a [DateTime]; reading its first four
+            # characters gave culture text ("02/1"), never the year. Feed real JSON text, not a hand-built string.
+            $script:PsNow = '{"models":[{"name":"qwen3:8b","context_length":8192,"expires_at":"2318-02-10T14:42:57.1234567Z"}]}' | ConvertFrom-Json
+            $script:PsNow.models[0].expires_at | Should -BeOfType [datetime]
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema | Out-Null
+            $script:Sent[-1]['keep_alive'] | Should -Be -1
+        }
+
+        It 'keeps a confirmed Forever pin through a /api/ps probe miss' {
+            $script:PsNow = '{"models":[{"name":"qwen3:8b","context_length":8192,"expires_at":"2318-02-10T14:42:57Z"}]}' | ConvertFrom-Json
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema | Out-Null
+            $script:Sent[-1]['keep_alive'] | Should -Be -1
+            InModuleScope OllamaOffload { $Script:Discovered = $Script:Discovered }   # discovery stays cached
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { throw 'timed out' }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') { [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable)); return (New-ChatResponse -Content '{"ok":true}') }
+                throw "no fixture for $Uri"
+            }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema | Out-Null
+            $script:Sent[-1]['keep_alive'] | Should -Be -1
+        }
+
+        It 'matches an untagged model to its :latest tag' {
+            $script:PsNow = '{"models":[{"name":"qwen3:latest","context_length":8192,"expires_at":"2318-02-10T14:42:57Z"}]}' | ConvertFrom-Json
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema -Model 'qwen3' | Out-Null
+            $script:Sent[-1]['keep_alive'] | Should -Be -1
+        }
+
+        It 'sends env OLLAMA_OFFLOAD_KEEP_ALIVE=-1 as the INTEGER (the string is a 400)' {
+            $env:OLLAMA_OFFLOAD_KEEP_ALIVE = '-1'
+            try {
+                $script:PsNow = $script:Ps
+                Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema | Out-Null
+                $script:Sent[-1]['keep_alive'] | Should -Be -1
+                $script:Sent[-1]['keep_alive'] | Should -BeOfType [long]
+            } finally { Remove-Item Env:OLLAMA_OFFLOAD_KEEP_ALIVE -ErrorAction SilentlyContinue }
+        }
+
+        It 'honours an explicit keep_alive' {
+            $script:PsNow = [pscustomobject]@{ models = @([pscustomobject]@{ name = 'qwen3:8b'; context_length = 8192; expires_at = '2319-01-18T22:22:11Z' }) }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema -KeepAlive '30m' | Out-Null
+            $script:Sent[-1]['keep_alive'] | Should -Be '30m'
         }
 
         It 'emits the same _meta keys as the Python twin' {
@@ -107,6 +186,234 @@ Describe 'OllamaOffload' {
             ($result['_meta'].Keys | Sort-Object) | Should -Be $expected
             $result['_meta'].eval_tokens   | Should -Be 11
             $result['_meta'].prompt_tokens | Should -Be 22
+        }
+    }
+
+    Context 'public status (twin of Python status() / clear_cooldown())' {
+
+        It 'reports the discovered model, the num_ctx it would send, and a confirmed window' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                throw "no fixture for $Uri"
+            }
+            $st = Get-OllamaStatus
+            $st.model | Should -Be 'qwen3:8b'
+            $st.model_source | Should -Be 'cfg'   # the shipped config pins qwen3:8b; a pin outranks /api/ps
+            $st.context_tokens | Should -Be 8192
+            $st.context_confirmed | Should -BeTrue
+            $st.cooldown_s | Should -Be 0
+            $st.host | Should -Be (Get-OllamaActiveHost)
+            @($st.PSObject.Properties.Name | Sort-Object) | Should -Be @('base_url','context_confirmed','context_tokens','cooldown_s','host','model','model_source')
+        }
+
+        It 'says unconfirmed when no window can be read' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return [pscustomobject]@{ models = @([pscustomobject]@{ name = 'qwen3:8b' }) } }
+                if ($Uri -like '*/api/show') { throw 'busy' }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                throw "no fixture for $Uri"
+            }
+            (Get-OllamaStatus).context_confirmed | Should -BeFalse
+        }
+
+        It 'reports and clears a cooldown' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                throw "no fixture for $Uri"
+            }
+            InModuleScope OllamaOffload { _SetCooldownFor -HostName (Get-OllamaActiveHost) -Seconds 300 }
+            (Get-OllamaStatus).cooldown_s | Should -BeGreaterThan 0
+            @(Clear-OllamaCooldown).Count | Should -BeGreaterThan 0
+            (Get-OllamaStatus).cooldown_s | Should -Be 0
+        }
+    }
+
+    Context 'budget refusal (-InputRatio, twin of Python input_ratio)' {
+
+        BeforeEach {
+            $script:Sent = [System.Collections.ArrayList]::new()
+            $script:VersionDown = $false
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/version') { if ($script:VersionDown) { throw 'connection refused' } return @{ version = '0.12.0' } }
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') { [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable)); return (New-ChatResponse -Content '{"ok":true}') }
+                throw "no fixture for $Uri"
+            }
+            $script:Schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+        }
+
+        It 'sends a prompt within the budget whole' {
+            $p = 'a' * 1000   # 8192 x 0.4 x 4 = 13107
+            Invoke-OllamaCall -TaskPrompt $p -Schema $script:Schema -InputRatio 0.4 | Out-Null
+            $script:Sent[-1].messages[-1].content | Should -Be $p
+        }
+
+        It 'refuses an oversize prompt with its sizes, sends nothing, arms no cooldown' {
+            $err = { Invoke-OllamaCall -TaskPrompt ('b' * 20000) -Schema $script:Schema -InputRatio 0.4 } | Should -Throw -PassThru
+            $e = $err.Exception
+            $e.GetType().Name | Should -Be 'OllamaPromptTooLarge'
+            $e.GetType().BaseType.Name | Should -Be 'OllamaCallError'
+            $e.Chars | Should -Be 20000
+            $e.Budget | Should -Be 13107
+            $e.ContextTokens | Should -Be 8192
+            $script:Sent.Count | Should -Be 0
+            (InModuleScope OllamaOffload { _CooldownRemainingFor (Get-OllamaActiveHost) }) | Should -Be 0
+        }
+
+        It 'counts the system prompt' {
+            { Invoke-OllamaCall -TaskPrompt ('c' * 10000) -System ('s' * 4000) -InputRatio 0.4 } | Should -Throw
+            $script:Sent.Count | Should -Be 0
+        }
+
+        It 'reports a down host as OllamaUnavailable, not too large, and arms the cooldown' {
+            $script:VersionDown = $true
+            $err = { Invoke-OllamaCall -TaskPrompt ('d' * 20000) -Schema $script:Schema -InputRatio 0.4 } | Should -Throw -PassThru
+            $err.Exception.GetType().Name | Should -Be 'OllamaUnavailable'
+            (InModuleScope OllamaOffload { _CooldownRemainingFor (Get-OllamaActiveHost) }) | Should -BeGreaterThan 0
+        }
+
+        It 'does no check without -InputRatio' {
+            Invoke-OllamaCall -TaskPrompt ('e' * 20000) -Schema $script:Schema | Out-Null
+            $script:Sent.Count | Should -Be 1
+        }
+    }
+
+    Context 'a host that is down during discovery (twin of Python TestDeadHostAtImport)' {
+
+        BeforeEach {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod { throw 'connection refused' }
+            # No model pin anywhere, so discovery is what fails (the shipped config pins one).
+            InModuleScope OllamaOffload {
+                $cfg = Get-OllamaConfig
+                $cfg.Remove('model')
+                if ($cfg.ContainsKey('hosts')) { foreach ($h in @($cfg['hosts'].Values)) { if ($h -is [System.Collections.IDictionary]) { $h.Remove('model') } } }
+                $Script:Discovered = $null
+            }
+        }
+
+        It 'is OllamaUnavailable and benches the host' {
+            $err = { Invoke-OllamaCall -TaskPrompt 'go' } | Should -Throw -PassThru
+            $err.Exception.GetType().Name | Should -Be 'OllamaUnavailable'
+            (InModuleScope OllamaOffload { _CooldownRemainingFor (Get-OllamaActiveHost) }) | Should -BeGreaterThan 0
+        }
+
+        It 'does not probe a benched host again' {
+            InModuleScope OllamaOffload { _SetCooldownFor -HostName (Get-OllamaActiveHost) -Seconds 300 }
+            $err = { Invoke-OllamaCall -TaskPrompt 'go' } | Should -Throw -PassThru
+            $err.Exception.GetType().Name | Should -Be 'OllamaUnavailable'
+            Should -Invoke -ModuleName OllamaOffload Invoke-RestMethod -Times 0 -Exactly
+        }
+    }
+
+    Context 'PowerShell walks the same model ladder as Python, on the wire and in status' {
+
+        BeforeEach {
+            $script:Sent = [System.Collections.ArrayList]::new()
+            $script:PsNow = '{"models":[{"name":"a:1b","context_length":4096}]}' | ConvertFrom-Json
+            $script:TagsNow = '{"models":[{"name":"a:1b"}]}' | ConvertFrom-Json
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/version') { return @{ version = '0.12.0' } }
+                if ($Uri -like '*/api/ps')   { return $script:PsNow }
+                if ($Uri -like '*/api/show') { return [pscustomobject]@{ parameters = "num_ctx 16384" } }
+                if ($Uri -like '*/api/tags') { return $script:TagsNow }
+                if ($Uri -like '*/api/chat') { [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable)); return (New-ChatResponse -Content '{"ok":true}') }
+                throw "no fixture for $Uri"
+            }
+            # A hosts map whose active host PINS b:1b while /api/ps has a:1b loaded (no raw-URL override).
+            Remove-Item Env:OLLAMA_OFFLOAD_URL -ErrorAction SilentlyContinue
+            InModuleScope OllamaOffload {
+                $cfg = Get-OllamaConfig
+                $cfg.Remove('model')
+                $cfg['default_host'] = 'f'
+                $cfg['hosts'] = @{ f = @{ url = 'http://test.invalid:11434/api/chat'; model = 'b:1b' } }
+                $Script:Discovered = $null
+                $Script:ActiveHost = $null   # resolved at import under the raw-URL env; re-resolve under this config
+            }
+            $script:Schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+        }
+
+        It 'sends the host pin, not the loaded model (Python parity)' {
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema | Out-Null
+            $script:Sent[-1]['model'] | Should -Be 'b:1b'
+        }
+
+        It 'status reports the host pin as cfg, matching the wire' {
+            $st = Get-OllamaStatus
+            $st.model | Should -Be 'b:1b'
+            $st.model_source | Should -Be 'cfg'
+        }
+
+        It 'status on the hint path reports what the call would rediscover, not the hint' {
+            InModuleScope OllamaOffload {
+                (Get-OllamaConfig)['hosts']['f'].Remove('model')
+                $Script:Discovered = @{ Model = $Script:DefaultModelHint; ContextTokens = 8192; KeepAlive = '5m'; BaseUrl = 'http://test.invalid:11434' }
+                $Script:DefaultModelSource = 'hint'
+                # A pinned host never reaches the startup-miss recovery path (the pin outranks discovery): drop the pin.
+                (Get-OllamaConfig).Remove('model'); $Script:ActiveHost = $null
+            }
+            $st = Get-OllamaStatus
+            $st.model | Should -Be 'a:1b'
+            $st.model_source | Should -Not -Be 'hint'
+        }
+    }
+
+    Context 'Get-OllamaStatus has no side effects' {
+
+        It 'status on the hint path, then a call: the wire carries what status reported' {
+            $script:Sent = [System.Collections.ArrayList]::new()
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/version') { return @{ version = '0.12.0' } }
+                if ($Uri -like '*/api/ps')   { return ('{"models":[]}' | ConvertFrom-Json) }
+                if ($Uri -like '*/api/tags') { return ('{"models":[{"name":"a:1b"}]}' | ConvertFrom-Json) }
+                if ($Uri -like '*/api/show') { return [pscustomobject]@{ parameters = "num_ctx 2048" } }
+                if ($Uri -like '*/api/chat') { [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable)); return (New-ChatResponse -Content '{"ok":true}') }
+                throw "no fixture for $Uri"
+            }
+            InModuleScope OllamaOffload {
+                (Get-OllamaConfig).Remove('model'); $Script:ActiveHost = $null
+                $Script:Discovered = @{ Model = $Script:DefaultModelHint; ContextTokens = 8192; KeepAlive = '5m'; BaseUrl = 'http://test.invalid:11434' }
+                $Script:DefaultModelSource = 'hint'
+            }
+            $st = Get-OllamaStatus
+            $st.model | Should -Be 'a:1b'
+            (InModuleScope OllamaOffload { $Script:DefaultModelSource }) | Should -Be 'hint' -Because 'status must not change module state'
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') } | Out-Null
+            $script:Sent[-1]['model'] | Should -Be $st.model
+        }
+    }
+
+    Context 'memo repair and tag-aware context probe' {
+
+        It 'repairs a corrupt memo on the next successful probe and keeps the pin through a later miss' {
+            $script:Sent = [System.Collections.ArrayList]::new()
+            $script:PsNow = '{"models":[{"name":"qwen3:8b","context_length":8192,"expires_at":"2318-02-10T14:42:57Z"}]}' | ConvertFrom-Json
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:PsNow }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') { [void]$script:Sent.Add(($Body | ConvertFrom-Json -AsHashtable)); return (New-ChatResponse -Content '{"ok":true}') }
+                throw "no fixture for $Uri"
+            }
+            $memo = InModuleScope OllamaOffload { _KeepAliveMemoPath -BaseUrl 'http://test.invalid:11434' }
+            Set-Content -Path $memo -Value '{bad json' -Encoding utf8
+            $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+            Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
+            (Get-Content -Raw $memo | ConvertFrom-Json -AsHashtable)['qwen3:8b'] | Should -BeTrue
+        }
+
+        It 'matches an untagged name to /api/ps for the RUNTIME window' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return ('{"models":[{"name":"qwen3:latest","context_length":12345}]}' | ConvertFrom-Json) }
+                if ($Uri -like '*/api/show') { return [pscustomobject]@{ parameters = "num_ctx 16384" } }
+                throw "no fixture for $Uri"
+            }
+            (InModuleScope OllamaOffload { _ProbeContextTokensForHostStrict -Model 'qwen3' -BaseUrl 'http://test.invalid:11434' }) | Should -Be 12345
         }
     }
 
@@ -128,6 +435,37 @@ Describe 'OllamaOffload' {
 
             $remaining = InModuleScope OllamaOffload { _CooldownRemainingFor (Get-OllamaActiveHost) }
             $remaining | Should -Be 0 -Because 'a model fault must never arm the cooldown'
+        }
+
+        It 'raises OllamaCallError when a schema reply lacks a required key (twin parity with Python)' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps')   { return $script:Ps }
+                if ($Uri -like '*/api/show') { return $script:Show }
+                if ($Uri -like '*/api/tags') { return $script:Tags }
+                if ($Uri -like '*/api/chat') { return (New-ChatResponse -Content '{"other":1}') }
+                throw "no fixture for $Uri"
+            }
+            $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+            $err = { Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema } | Should -Throw -PassThru
+            $err.Exception.GetType().Name | Should -Be 'OllamaCallError'
+            $remaining = InModuleScope OllamaOffload { _CooldownRemainingFor (Get-OllamaActiveHost) }
+            $remaining | Should -Be 0
+        }
+
+        It 'raises OllamaCallError when a schema reply is JSON but not an object' {
+            foreach ($reply in @('42', '["ok"]', '[{"ok":true}]')) {   # the last: a one-element array must stay an array
+                $script:Reply = $reply
+                Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                    if ($Uri -like '*/api/ps')   { return $script:Ps }
+                    if ($Uri -like '*/api/show') { return $script:Show }
+                    if ($Uri -like '*/api/tags') { return $script:Tags }
+                    if ($Uri -like '*/api/chat') { return (New-ChatResponse -Content $script:Reply) }
+                    throw "no fixture for $Uri"
+                }
+                $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
+                $err = { Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema } | Should -Throw -PassThru
+            $err.Exception.GetType().Name | Should -Be 'OllamaCallError'
+            }
         }
 
         It 'benches the host when the transport fails' {
@@ -278,6 +616,8 @@ Describe 'OllamaOffload' {
                     BaseUrl = 'http://test.invalid:11434'
                 }
                 $Script:DefaultModelSource = 'hint'
+                # A pinned host never reaches the startup-miss recovery path (the pin outranks discovery): drop the pin.
+                (Get-OllamaConfig).Remove('model'); $Script:ActiveHost = $null
             }
             $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
             Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
@@ -336,6 +676,8 @@ Describe 'OllamaOffload' {
                     BaseUrl = 'http://test.invalid:11434'
                 }
                 $Script:DefaultModelSource = 'hint'
+                # A pinned host never reaches the startup-miss recovery path (the pin outranks discovery): drop the pin.
+                (Get-OllamaConfig).Remove('model'); $Script:ActiveHost = $null
             }
             # Point 1: post-prime — reader sees the hint-era 262144.
             $cbImport = Get-OllamaContextBytes -Ratio 0.5
@@ -419,6 +761,8 @@ Describe 'OllamaOffload' {
                     BaseUrl = 'http://test.invalid:11434'
                 }
                 $Script:DefaultModelSource = 'hint'
+                # A pinned host never reaches the startup-miss recovery path (the pin outranks discovery): drop the pin.
+                (Get-OllamaConfig).Remove('model'); $Script:ActiveHost = $null
             }
             $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
             Invoke-OllamaCall -TaskPrompt 'go' -Schema $schema | Out-Null
@@ -488,6 +832,8 @@ Describe 'OllamaOffload' {
                     BaseUrl = 'http://test.invalid:11434'
                 }
                 $Script:DefaultModelSource = 'hint'
+                # A pinned host never reaches the startup-miss recovery path (the pin outranks discovery): drop the pin.
+                (Get-OllamaConfig).Remove('model'); $Script:ActiveHost = $null
             }
             $HINT_MODEL = InModuleScope OllamaOffload { $Script:DefaultModelHint }
             $schema = @{ type = 'object'; properties = @{ ok = @{ type = 'boolean' } }; required = @('ok') }
