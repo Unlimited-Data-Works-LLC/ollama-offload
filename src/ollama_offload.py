@@ -23,6 +23,7 @@ the shape is right; it says nothing about whether the answer is.
 """
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -796,6 +797,24 @@ def ollama_alive(timeout_s: int = 4, *, base_url: str | None = None) -> bool:
         return False
 
 
+def _encode_images(images: list) -> list[str]:
+    """Base64-encode images for Ollama's /api/chat `images` field.
+
+    Each item is raw bytes or a path (str or os.PathLike) to an existing file. Anything else raises
+    OllamaConfigError before any network call: a caller fault, so it must never bench a host.
+    """
+    encoded = []
+    for item in images:
+        if isinstance(item, (bytes, bytearray)):
+            data = bytes(item)
+        elif isinstance(item, (str, os.PathLike)) and Path(item).is_file():
+            data = Path(item).read_bytes()
+        else:
+            raise OllamaConfigError(f"images: expected bytes or a path to an existing file, got {item!r:.80}")
+        encoded.append(base64.b64encode(data).decode("ascii"))
+    return encoded
+
+
 def _call_ollama_once(
     task_prompt: str,
     schema: dict | None = None,
@@ -816,6 +835,9 @@ def _call_ollama_once(
     top_logprobs: int | None = 5,
     input_ratio: float | None = None,
     chars_per_token: int = 4,
+    # Images for a vision model, attached to the user message as Ollama's `images` field (base64).
+    # Each item is a file path or raw bytes. None or empty = text-only (the wire body is unchanged).
+    images: list | None = None,
 ) -> dict | str:
     """Single-shot Ollama call — one host, no failover.
 
@@ -1036,7 +1058,10 @@ def _call_ollama_once(
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": task_prompt})
+    user_message = {"role": "user", "content": task_prompt}
+    if images:
+        user_message["images"] = _encode_images(images)
+    messages.append(user_message)
 
     body = {
         "model": _effective_model,
@@ -1326,6 +1351,9 @@ def call_ollama(
     top_logprobs: int | None = 5,
     input_ratio: float | None = None,
     chars_per_token: int = 4,
+    # Images for a vision model, attached to the user message as Ollama's `images` field (base64).
+    # Each item is a file path or raw bytes. None or empty = text-only (the wire body is unchanged).
+    images: list | None = None,
 ) -> dict | str:
     """Call Ollama with optional cross-host failover.
 
@@ -1412,6 +1440,7 @@ def call_ollama(
             temperature=temperature,
             logprobs=logprobs, top_logprobs=top_logprobs,
             input_ratio=input_ratio, chars_per_token=chars_per_token,
+            images=images,
         )
     # db-sme Batch-2 NTH#2 fold: legacy global cooldown active → skip the
     # whole chain (every host is benched by the global OR-read semantic).
@@ -1445,6 +1474,7 @@ def call_ollama(
                 temperature=temperature,
                 logprobs=logprobs, top_logprobs=top_logprobs,
                 input_ratio=input_ratio, chars_per_token=chars_per_token,
+                images=images,
             )
             if isinstance(result, dict) and i > 0:
                 # Failover fired — record the actual chain traversed for

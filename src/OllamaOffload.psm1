@@ -775,6 +775,8 @@ function _InvokeOllamaCallOnce {
         [int]$TopLogprobs = 5,
         [double]$InputRatio = 0,
         [int]$CharsPerToken = 4,
+        # Images for a vision model (paths or byte arrays), sent base64 on the user message. Parity: Python images=.
+        [object[]]$Images = $null,
         # per-call host override. When set, this call
         # resolves the named host via _ResolveHostByName + uses THAT host's
         # url/model for THIS invocation only — bypasses the module-cached
@@ -1030,7 +1032,15 @@ function _InvokeOllamaCallOnce {
 
     $messages = @()
     if ($System) { $messages += @{ role = 'system'; content = $System } }
-    $messages += @{ role = 'user'; content = $TaskPrompt }
+    $userMessage = @{ role = 'user'; content = $TaskPrompt }
+    if ($Images -and $Images.Count -gt 0) {
+        $userMessage.images = @($Images | ForEach-Object {
+            if ($_ -is [byte[]]) { [Convert]::ToBase64String($_) }
+            elseif (($_ -is [string] -or $_ -is [System.IO.FileInfo]) -and (Test-Path -LiteralPath $_ -PathType Leaf)) { [Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $_).Path)) }
+            else { throw "images: expected a byte array or a path to an existing file, got '$_'" }
+        })
+    }
+    $messages += $userMessage
 
     # Parity: `temperature` joins `num_ctx` here. Previously this twin sent
     # num_ctx ONLY and Python sent temperature ONLY, so the same logical call produced a
@@ -1370,7 +1380,8 @@ function Invoke-OllamaCall {
         # Twin of Python input_ratio: refuse a prompt larger than InputRatio x the num_ctx this call would
         # send (OllamaPromptTooLarge), after cooldown and reachability. 0 = no check.
         [double]$InputRatio = 0,
-        [int]$CharsPerToken = 4)
+        [int]$CharsPerToken = 4,
+        [object[]]$Images = $null)
 
     $cfg = Get-OllamaConfig
     if ($null -eq $FailoverHosts) {
@@ -1400,9 +1411,9 @@ function Invoke-OllamaCall {
     if (-not $FailoverHosts -or $FailoverHosts.Count -eq 0) {
         # Single-host behaviour — one host, one try.
         if ($HostName) {
-            return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $HostName -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken
+            return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $HostName -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken -Images $Images
         }
-        return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken
+        return _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken -Images $Images
     }
 
     # Failover path — build ordered chain [primary, ...failover] dedup'd.
@@ -1416,7 +1427,7 @@ function Invoke-OllamaCall {
     for ($i = 0; $i -lt $chain.Count; $i++) {
         $h = $chain[$i]
         try {
-            $result = _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $h -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken
+            $result = _InvokeOllamaCallOnce -TaskPrompt $TaskPrompt -Schema $Schema -System $System -Temperature $Temperature -HostName $h -Model $Model -TimeoutSec $TimeoutSec -Think $Think -KeepAlive $KeepAlive -Logprobs:$Logprobs -TopLogprobs $TopLogprobs -InputRatio $InputRatio -CharsPerToken $CharsPerToken -Images $Images
             if ($Schema -and $i -gt 0 -and $result -is [hashtable]) {
                 # Failover fired — record the actual traversal for audit.
                 if (-not $result.ContainsKey('_meta')) { $result['_meta'] = @{} }

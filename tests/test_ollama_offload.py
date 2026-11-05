@@ -1317,3 +1317,38 @@ class TestStatusHasNoSideEffects(OllamaOffloadTestCase):
         self.assertEqual(self.mod._DEFAULT_MODEL_SOURCE, "hint", "status() must not change module state")
         self.mod.call_ollama("go", schema=SCHEMA)
         self.assertEqual([b for b in sent if "messages" in b][-1]["model"], st["model"], "the wire carries what status() reported")
+
+
+class TestImages(OllamaOffloadTestCase):
+    """`images=` attaches base64 images to the user message (vision models); absent = unchanged wire body."""
+
+    def test_images_attach_to_user_message_as_base64(self):
+        record = []
+        self._install({**HEALTHY, "/api/chat": _chat_response('{"ok": true}')}, record)
+        path = os.path.join(self._tmp.name, "pic.png")
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG-fake")
+        self.mod.call_ollama("describe", schema=SCHEMA, system="sys", images=[path, b"raw-bytes"])
+        chat = [r for r in record if "messages" in r][-1]
+        user = chat["messages"][-1]
+        self.assertEqual(user["role"], "user")
+        import base64
+        self.assertEqual(user["images"], [base64.b64encode(b"\x89PNG-fake").decode(),
+                                          base64.b64encode(b"raw-bytes").decode()])
+        self.assertNotIn("images", chat["messages"][0], "images never ride on the system message")
+
+    def test_no_images_leaves_wire_body_unchanged(self):
+        record = []
+        self._install({**HEALTHY, "/api/chat": _chat_response('{"ok": true}')}, record)
+        self.mod.call_ollama("describe", schema=SCHEMA)
+        chat = [r for r in record if "messages" in r][-1]
+        self.assertNotIn("images", chat["messages"][-1])
+
+    def test_bad_image_is_a_config_error_and_never_benches_the_host(self):
+        record = []
+        self._install({**HEALTHY, "/api/chat": _chat_response('{"ok": true}')}, record)
+        with self.assertRaises(self.mod.OllamaConfigError):
+            self.mod.call_ollama("describe", schema=SCHEMA, images=["/no/such/file.png"])
+        in_cooldown, _ = self.mod._in_cooldown_for(self.mod.active_host_name())
+        self.assertFalse(in_cooldown)
+        self.assertFalse([r for r in record if "messages" in r], "no chat request may be sent")

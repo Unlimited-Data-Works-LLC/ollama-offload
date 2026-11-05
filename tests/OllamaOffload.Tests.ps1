@@ -157,6 +157,22 @@ Describe 'OllamaOffload' {
             $script:Sent[-1]['keep_alive'] | Should -Be -1
         }
 
+        It 'attaches -Images base64 to the user message only (parity: Python images=)' {
+            $script:PsNow = $script:Ps
+            $pic = Join-Path $TestDrive 'pic.png'
+            [IO.File]::WriteAllBytes($pic, [byte[]](0x89, 0x50, 0x4E, 0x47))
+            Invoke-OllamaCall -TaskPrompt 'describe' -Schema $script:Schema -System 'sys' -Images @($pic, [byte[]](1, 2, 3)) | Out-Null
+            $msgs = $script:Sent[-1]['messages']
+            $msgs[-1]['images'] | Should -Be @([Convert]::ToBase64String([byte[]](0x89, 0x50, 0x4E, 0x47)), [Convert]::ToBase64String([byte[]](1, 2, 3)))
+            $msgs[0].ContainsKey('images') | Should -BeFalse
+        }
+
+        It 'sends no images field without -Images' {
+            $script:PsNow = $script:Ps
+            Invoke-OllamaCall -TaskPrompt 'describe' -Schema $script:Schema | Out-Null
+            $script:Sent[-1]['messages'][-1].ContainsKey('images') | Should -BeFalse
+        }
+
         It 'matches an untagged model to its :latest tag' {
             $script:PsNow = '{"models":[{"name":"qwen3:latest","context_length":8192,"expires_at":"2318-02-10T14:42:57Z"}]}' | ConvertFrom-Json
             Invoke-OllamaCall -TaskPrompt 'go' -Schema $script:Schema -Model 'qwen3' | Out-Null

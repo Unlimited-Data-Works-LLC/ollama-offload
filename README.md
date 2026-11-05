@@ -223,6 +223,23 @@ in a cooldown, so a server that is down raises `OllamaUnavailable`, never "too l
 error carries `chars`, `budget`, `ratio`, `context_tokens` and `context_confirmed` (PowerShell:
 `Chars`, `Budget`, `Ratio`, `ContextTokens`, `ContextConfirmed`).
 
+## Images (vision models)
+
+Pass images to a model whose `/api/show` capabilities include `vision`:
+
+```python
+oo.call_ollama("Describe this object.", schema=schema, images=["photo.png", raw_bytes])
+```
+```powershell
+Invoke-OllamaCall -TaskPrompt 'Describe this object.' -Schema $schema -Images @('photo.png', $bytes)
+```
+
+Each item is a file path or raw bytes. They are sent base64-encoded in the user message's `images`
+field and never on the system message. Without `images` the request body is unchanged. A missing
+file or wrong type raises `OllamaConfigError` before anything is sent: it is a caller fault, so it
+never puts the server into a cooldown. Images do not count towards the `input_ratio` budget, which
+measures text only.
+
 ## Status
 
 Ask the module what it will do, instead of reading its internals:
