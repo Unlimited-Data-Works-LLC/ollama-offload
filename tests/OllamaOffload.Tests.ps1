@@ -102,6 +102,34 @@ Describe 'OllamaOffload' {
         }
     }
 
+    Context 'GPU housekeeping: loaded models and unload (parity: Python loaded_models / unload)' {
+
+        BeforeEach {
+            $script:Sent = [System.Collections.ArrayList]::new()
+            Mock -ModuleName OllamaOffload Invoke-RestMethod {
+                if ($Uri -like '*/api/ps') { return [pscustomobject]@{ models = @([pscustomobject]@{ name = 'a:1b' }, [pscustomobject]@{ name = 'b:2b' }) } }
+                if ($Uri -like '*/api/generate') { [void]$script:Sent.Add(@{ Uri = $Uri; Body = ($Body | ConvertFrom-Json -AsHashtable) }); return @{} }
+                throw "no fixture for $Uri"
+            }
+        }
+
+        It 'lists the loaded model names from the given base URL' {
+            Get-OllamaLoadedModels -BaseUrl 'http://gpu.invalid:11434' | Should -Be @('a:1b', 'b:2b')
+        }
+
+        It 'unloads with keep_alive 0 on /api/generate at the given base URL' {
+            Invoke-OllamaUnload -Model 'a:1b' -BaseUrl 'http://gpu.invalid:11434'
+            $script:Sent[-1].Uri | Should -Be 'http://gpu.invalid:11434/api/generate'
+            $script:Sent[-1].Body['model'] | Should -Be 'a:1b'
+            $script:Sent[-1].Body['keep_alive'] | Should -Be 0
+        }
+
+        It 'throws when the host does not answer (never reports an empty list)' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod { throw 'connection refused' }
+            { Get-OllamaLoadedModels -BaseUrl 'http://gpu.invalid:11434' } | Should -Throw
+        }
+    }
+
     Context 'keep_alive auto conforms to the loaded model' {
 
         BeforeEach {

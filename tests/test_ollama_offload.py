@@ -1352,3 +1352,24 @@ class TestImages(OllamaOffloadTestCase):
         in_cooldown, _ = self.mod._in_cooldown_for(self.mod.active_host_name())
         self.assertFalse(in_cooldown)
         self.assertFalse([r for r in record if "messages" in r], "no chat request may be sent")
+
+
+class TestGpuHousekeeping(OllamaOffloadTestCase):
+    """loaded_models() / unload() for co-located GPU jobs (parity: Get-OllamaLoadedModels / Invoke-OllamaUnload)."""
+
+    BASE = "http://gpu.invalid:11434"
+
+    def test_loaded_models_lists_names_from_base_url(self):
+        self._install({self.BASE + "/api/ps": {"models": [{"name": "a:1b"}, {"name": "b:2b"}]}})
+        self.assertEqual(self.mod.loaded_models(base_url=self.BASE), ["a:1b", "b:2b"])
+
+    def test_unload_posts_keep_alive_zero(self):
+        record = []
+        self._install({self.BASE + "/api/generate": {}}, record)
+        self.mod.unload("a:1b", base_url=self.BASE)
+        self.assertEqual(record, [{"model": "a:1b", "keep_alive": 0}])
+
+    def test_unreachable_host_raises_never_reports_empty(self):
+        self._install({self.BASE + "/api/ps": urllib.error.URLError("refused")})
+        with self.assertRaises(urllib.error.URLError):
+            self.mod.loaded_models(base_url=self.BASE)

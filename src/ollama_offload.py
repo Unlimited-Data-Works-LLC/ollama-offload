@@ -423,6 +423,32 @@ def active_host_name() -> str:
     return _ACTIVE_HOST["name"]
 
 
+def loaded_models(*, base_url: str | None = None, timeout: float = 5) -> list[str]:
+    """Names of the models the host has loaded in memory right now (/api/ps).
+
+    For GPU housekeeping, e.g. a co-located GPU job that must free the card first. Raises the
+    urllib error when the host does not answer: an unknown state is never reported as "nothing loaded".
+    ``base_url`` (API root, no /api/...) defaults to the active host.
+    """
+    base = base_url or _api_base()
+    with urllib.request.urlopen(urllib.request.Request(base + "/api/ps"), timeout=timeout) as resp:
+        return [m["name"] for m in json.loads(resp.read().decode("utf-8")).get("models", [])]
+
+
+def unload(model: str, *, base_url: str | None = None, timeout: float = 60) -> None:
+    """Ask the host to drop ``model`` from memory now (/api/generate with keep_alive 0).
+
+    Ollama answers before its runner has released the VRAM (measured 2026-11-05: a load 1 s later
+    OOM'd), so a caller that needs the memory must wait for it to show as free. A pinned model is
+    re-pinned by whatever pins it on its next call; this never re-pins. Raises the urllib error on failure.
+    """
+    base = base_url or _api_base()
+    body = json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")
+    req = urllib.request.Request(base + "/api/generate", data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        resp.read()
+
+
 def _discover_model(*, base_url: str | None = None) -> str:
     """Learn the primary chat model DYNAMICALLY from the host at runtime.
 

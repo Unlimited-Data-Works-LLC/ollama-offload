@@ -279,6 +279,34 @@ function Get-OllamaActiveHost {
     return (_ResolveActiveHost).Name
 }
 
+function Get-OllamaLoadedModels {
+    <#
+    .SYNOPSIS
+      Names of the models the host has loaded in memory right now (/api/ps). PS twin of Python
+      `loaded_models()`. For GPU housekeeping. Throws when the host does not answer: an unknown
+      state is never reported as "nothing loaded".
+    .PARAMETER BaseUrl
+      API root (no /api/...). Defaults to the active host.
+    #>
+    [CmdletBinding()] param([string]$BaseUrl, [int]$TimeoutSec = 5)
+    $base = if ($BaseUrl) { $BaseUrl } else { _GetBaseUrl }
+    $ps = Invoke-RestMethod -Method Get -Uri "$base/api/ps" -TimeoutSec $TimeoutSec
+    return @($ps.models | ForEach-Object { $_.name })
+}
+
+function Invoke-OllamaUnload {
+    <#
+    .SYNOPSIS
+      Ask the host to drop a model from memory now (/api/generate, keep_alive 0). PS twin of
+      Python `unload()`. Ollama answers before its runner has released the VRAM, so a caller that
+      needs the memory must wait for it to show as free. Never re-pins.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Model, [string]$BaseUrl, [int]$TimeoutSec = 60)
+    $base = if ($BaseUrl) { $BaseUrl } else { _GetBaseUrl }
+    $body = @{ model = $Model; keep_alive = 0 } | ConvertTo-Json -Compress
+    Invoke-RestMethod -Method Post -Uri "$base/api/generate" -Body $body -ContentType 'application/json' -TimeoutSec $TimeoutSec | Out-Null
+}
+
 function _GetBaseUrl {
     # LEGACY entry-point retained for internal callers (_Discover, Test-OllamaReachable,
     # Invoke-OllamaCall). Composes _ResolveActiveHost with OLLAMA_OFFLOAD_OLLAMA_BASE_URL BC
@@ -1600,4 +1628,5 @@ function Clear-OllamaCooldown {
 Export-ModuleMember -Function `
     Get-OllamaConfig, Get-OllamaConsumerConfig, Get-OllamaContextBytes, `
     Invoke-OllamaCall, Test-OllamaReachable, Get-OllamaActiveHost, `
-    Get-OllamaHealthcheck, Test-OllamaProbe, Get-OllamaStatus, Clear-OllamaCooldown
+    Get-OllamaHealthcheck, Test-OllamaProbe, Get-OllamaStatus, Clear-OllamaCooldown, `
+    Get-OllamaLoadedModels, Invoke-OllamaUnload

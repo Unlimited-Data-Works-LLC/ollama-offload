@@ -240,6 +240,24 @@ file or wrong type raises `OllamaConfigError` before anything is sent: it is a c
 never puts the server into a cooldown. Images do not count towards the `input_ratio` budget, which
 measures text only.
 
+## Sharing the GPU (loaded models, unload)
+
+A job on the same GPU, such as an image generator, may need Ollama to release the card first:
+
+```python
+for name in oo.loaded_models(base_url="http://127.0.0.1:11434"):
+    oo.unload(name, base_url="http://127.0.0.1:11434")
+```
+```powershell
+Get-OllamaLoadedModels -BaseUrl 'http://127.0.0.1:11434' | ForEach-Object { Invoke-OllamaUnload -Model $_ -BaseUrl 'http://127.0.0.1:11434' }
+```
+
+`base_url` defaults to the active host. Pass the local server when the GPU you mean is the local one,
+because the active host can be a failover on another machine. Both raise when the host does not
+answer, so an unknown state is never read as "nothing loaded". `unload` sends `keep_alive: 0`, and
+Ollama replies before its runner has freed the VRAM: wait until the memory shows as free before you
+allocate. Nothing here re-pins a model; whatever pins it does so again on its next call.
+
 ## Status
 
 Ask the module what it will do, instead of reading its internals:
