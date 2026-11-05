@@ -128,6 +128,16 @@ Describe 'OllamaOffload' {
             Mock -ModuleName OllamaOffload Invoke-RestMethod { throw 'connection refused' }
             { Get-OllamaLoadedModels -BaseUrl 'http://gpu.invalid:11434' } | Should -Throw
         }
+
+        It 'unload throws when the host does not answer' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod { throw 'connection refused' }
+            { Invoke-OllamaUnload -Model 'a:1b' -BaseUrl 'http://gpu.invalid:11434' } | Should -Throw
+        }
+
+        It 'skips a loaded entry that has no name' {
+            Mock -ModuleName OllamaOffload Invoke-RestMethod { [pscustomobject]@{ models = @([pscustomobject]@{ size = 1 }, [pscustomobject]@{ name = 'a:1b' }) } }
+            Get-OllamaLoadedModels -BaseUrl 'http://gpu.invalid:11434' | Should -Be @('a:1b')
+        }
     }
 
     Context 'keep_alive auto conforms to the loaded model' {

@@ -254,7 +254,8 @@ Get-OllamaLoadedModels -BaseUrl 'http://127.0.0.1:11434' | ForEach-Object { Invo
 
 `base_url` defaults to the active host. Pass the local server when the GPU you mean is the local one,
 because the active host can be a failover on another machine. Both raise when the host does not
-answer, so an unknown state is never read as "nothing loaded". `unload` sends `keep_alive: 0`, and
+answer, so an unknown state is never read as "nothing loaded". An `/api/ps` entry without a name
+is skipped, since it cannot be unloaded by name. `unload` sends `keep_alive: 0`, and
 Ollama replies before its runner has freed the VRAM: wait until the memory shows as free before you
 allocate. Nothing here re-pins a model; whatever pins it does so again on its next call.
 

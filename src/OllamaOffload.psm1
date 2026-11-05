@@ -291,7 +291,9 @@ function Get-OllamaLoadedModels {
     [CmdletBinding()] param([string]$BaseUrl, [int]$TimeoutSec = 5)
     $base = if ($BaseUrl) { $BaseUrl } else { _GetBaseUrl }
     $ps = Invoke-RestMethod -Method Get -Uri "$base/api/ps" -TimeoutSec $TimeoutSec
-    return @($ps.models | ForEach-Object { $_.name })
+    # An entry without a name is skipped, same as the Python twin (it cannot be unloaded by name anyway).
+    # Test the property first: under StrictMode reading a missing .name throws.
+    return @($ps.models | Where-Object { $_.PSObject.Properties['name'] -and $_.name } | ForEach-Object { $_.name })
 }
 
 function Invoke-OllamaUnload {

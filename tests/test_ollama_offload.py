@@ -1373,3 +1373,12 @@ class TestGpuHousekeeping(OllamaOffloadTestCase):
         self._install({self.BASE + "/api/ps": urllib.error.URLError("refused")})
         with self.assertRaises(urllib.error.URLError):
             self.mod.loaded_models(base_url=self.BASE)
+
+    def test_unload_raises_when_host_does_not_answer(self):
+        self._install({self.BASE + "/api/generate": urllib.error.URLError("refused")})
+        with self.assertRaises(urllib.error.URLError):
+            self.mod.unload("a:1b", base_url=self.BASE)
+
+    def test_entry_without_name_is_skipped(self):
+        self._install({self.BASE + "/api/ps": {"models": [{"size": 1}, {"name": "a:1b"}]}})
+        self.assertEqual(self.mod.loaded_models(base_url=self.BASE), ["a:1b"])

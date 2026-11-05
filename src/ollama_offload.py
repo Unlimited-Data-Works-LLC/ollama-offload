@@ -432,7 +432,8 @@ def loaded_models(*, base_url: str | None = None, timeout: float = 5) -> list[st
     """
     base = base_url or _api_base()
     with urllib.request.urlopen(urllib.request.Request(base + "/api/ps"), timeout=timeout) as resp:
-        return [m["name"] for m in json.loads(resp.read().decode("utf-8")).get("models", [])]
+        # An entry without a name is skipped, same as the PS twin (it cannot be unloaded by name anyway)
+        return [m["name"] for m in json.loads(resp.read().decode("utf-8")).get("models", []) if m.get("name")]
 
 
 def unload(model: str, *, base_url: str | None = None, timeout: float = 60) -> None:
